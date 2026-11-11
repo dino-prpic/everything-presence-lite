@@ -58,10 +58,17 @@ globals:
     type: bool
     restore_value: False
     initial_value: 'false'
-  - id: last_zone_hold
-    type: int
+  # Entry/exit tracking: until this time every new target is accepted wherever it
+  # appears, so people already in the room at boot (or when Entry Exit is turned
+  # on) are picked up. After it, new targets must appear inside an entry zone.
+  - id: entry_gate_grace_until
+    type: unsigned long
     restore_value: False
-    initial_value: '0'
+    initial_value: '15000'
+  - id: tracker_reset
+    type: bool
+    restore_value: False
+    initial_value: 'true'
   - id: last_target_x_mm
     type: float
     restore_value: False
@@ -262,6 +269,13 @@ switch:
     restore_mode: RESTORE_DEFAULT_OFF
     optimistic: true
     entity_category: config
+    on_turn_on:
+      - lambda: |-
+          id(tracker_reset) = true;
+          id(entry_gate_grace_until) = millis() + 15000;
+    on_turn_off:
+      - lambda: |-
+          id(tracker_reset) = true;
 
 binary_sensor:
   - platform: template
@@ -378,6 +392,45 @@ number:
     entity_category: config
 
   - platform: template
+    name: "Entry Exit Match Distance"
+    id: track_match_distance
+    min_value: 200
+    max_value: 3000
+    step: 50
+    optimistic: true
+    restore_value: true
+    initial_value: 1000
+    unit_of_measurement: "mm"
+    entity_category: config
+    icon: "mdi:map-marker-distance"
+
+  - platform: template
+    name: "Entry Exit Reacquire Distance"
+    id: track_reacquire_distance
+    min_value: 0
+    max_value: 6000
+    step: 50
+    optimistic: true
+    restore_value: true
+    initial_value: 1500
+    unit_of_measurement: "mm"
+    entity_category: config
+    icon: "mdi:map-marker-radius"
+
+  - platform: template
+    name: "Entry Exit Promote Distance"
+    id: false_detection_promote_distance
+    min_value: 0
+    max_value: 6000
+    step: 50
+    optimistic: true
+    restore_value: true
+    initial_value: 0
+    unit_of_measurement: "mm"
+    entity_category: config
+    icon: "mdi:account-question"
+
+  - platform: template
     name: "Zone 1 Occupancy Off Delay"
     id: zone_1_off_delay
     max_value: 600
@@ -445,6 +498,24 @@ sensor:
     name: "Assumed Present Remaining"
     id: assumed_present_remaining_s
     unit_of_measurement: "s"
+    accuracy_decimals: 0
+    update_interval: never
+    entity_category: diagnostic
+  - platform: template
+    name: "Entry Exit Tracked Targets"
+    id: entry_exit_tracked_targets
+    accuracy_decimals: 0
+    update_interval: never
+    entity_category: diagnostic
+  - platform: template
+    name: "Entry Exit Held Targets"
+    id: entry_exit_held_targets
+    accuracy_decimals: 0
+    update_interval: never
+    entity_category: diagnostic
+  - platform: template
+    name: "Entry Exit Rejected Targets"
+    id: entry_exit_rejected_targets
     accuracy_decimals: 0
     update_interval: never
     entity_category: diagnostic
@@ -1041,7 +1112,11 @@ uart:
           float max_distance = float(id(distance).state) * 10;
           float installation_angle = id(installation_angle_ui).state * DEGREES_TO_RADIANS;
 
-          static unsigned long assumed_present_until = 0;
+          // True while the entry/exit tracker is holding a target that vanished
+          // outside an entry zone (value from the previous frame).
+          static bool hold_prev = false;
+          float det_x[3] = {0, 0, 0};
+          float det_y[3] = {0, 0, 0};
           static bool prev_detected[3] = {false,false,false};
           auto point_in_poly = [](float px, float py, const std::vector<float>& points) -> bool {
             const size_t point_count = points.size() / 2;
@@ -1091,7 +1166,7 @@ uart:
             if (p1_distance > max_distance) {
               p1_detected = false;
             } else {
-              float p1_angle = 0;
+              float p1_angle;
               if (installation_angle != 0 || (update_entities && id(extra_entities) >= 4)) {
                 p1_angle = atan2(p1_y, p1_x);
               }
@@ -1109,22 +1184,12 @@ uart:
                 p1_detected = false;
                 target_masked = true;
               } else {
-                if (point_in_poly(p1_x, p1_y, id(poly_zone_1_points))) {
-                  zone1_count++;
-                  id(last_zone_hold) = 1;
-                }
-                if (point_in_poly(p1_x, p1_y, id(poly_zone_2_points))) {
-                  zone2_count++;
-                  id(last_zone_hold) = 2;
-                }
-                if (point_in_poly(p1_x, p1_y, id(poly_zone_3_points))) {
-                  zone3_count++;
-                  id(last_zone_hold) = 3;
-                }
-                if (point_in_poly(p1_x, p1_y, id(poly_zone_4_points))) {
-                  zone4_count++;
-                  id(last_zone_hold) = 4;
-                }
+                det_x[0] = p1_x;
+                det_y[0] = p1_y;
+                if (point_in_poly(p1_x, p1_y, id(poly_zone_1_points))) zone1_count++;
+                if (point_in_poly(p1_x, p1_y, id(poly_zone_2_points))) zone2_count++;
+                if (point_in_poly(p1_x, p1_y, id(poly_zone_3_points))) zone3_count++;
+                if (point_in_poly(p1_x, p1_y, id(poly_zone_4_points))) zone4_count++;
               }
               if (update_entities) {
                 switch (id(extra_entities)) {
@@ -1143,7 +1208,6 @@ uart:
                         id(target1_resolution).publish_state(p1_resolution);
                       }
                     }
-                    [[fallthrough]];
                   case 4:
                     p1_angle = (p1_angle * RADIANS_TO_DEGREES) - 90;
 
@@ -1153,10 +1217,8 @@ uart:
                     if (id(target1_distance).state != p1_distance) {
                       id(target1_distance).publish_state(p1_distance);
                     }
-                    [[fallthrough]];
                   case 3:
                     id(target1_active).publish_state(true);
-                    [[fallthrough]];
                   case 2:
                   case 1:
                     if (id(target1_x).state != p1_x) {
@@ -1177,7 +1239,7 @@ uart:
             bool preventClear = id(entry_exit_enabled).state && !any_now && prev_detected[0];
             switch (id(extra_entities)) {
               case 5:
-                if (!(assumed_present_until != 0 && millis() < assumed_present_until) && !preventClear) {
+                if (!hold_prev && !preventClear) {
                   if (id(target1_speed).state != 0) {
                     id(target1_speed).publish_state(0);
                   }
@@ -1185,9 +1247,8 @@ uart:
                     id(target1_resolution).publish_state(0);
                   }
                 }
-                [[fallthrough]];
               case 4:
-                if (!(assumed_present_until != 0 && millis() < assumed_present_until) && !preventClear) {
+                if (!hold_prev && !preventClear) {
                   if (id(target1_distance).state != 0) {
                     id(target1_distance).publish_state(0);
                   }
@@ -1195,15 +1256,13 @@ uart:
                     id(target1_angle).publish_state(0);
                   }
                 }
-                [[fallthrough]];
               case 3:
-                if (!(assumed_present_until != 0 && millis() < assumed_present_until) && !preventClear) {
+                if (!hold_prev && !preventClear) {
                   id(target1_active).publish_state(false);
                 }
-                [[fallthrough]];
               case 2:
               case 1:
-                if (!(assumed_present_until != 0 && millis() < assumed_present_until) && !preventClear) {
+                if (!hold_prev && !preventClear) {
                   if (id(target1_x).state != 0) {
                     id(target1_x).publish_state(0);
                   }
@@ -1234,7 +1293,7 @@ uart:
             if (p2_distance > max_distance) {
               p2_detected = false;
             } else {
-              float p2_angle = 0;
+              float p2_angle;
               if (installation_angle != 0 || (update_entities && id(extra_entities) >= 4)) {
                 p2_angle = atan2(p2_y, p2_x);
               }
@@ -1252,10 +1311,12 @@ uart:
                 p2_detected = false;
                 target_masked = true;
               } else {
-                if (point_in_poly(p2_x, p2_y, id(poly_zone_1_points))) { zone1_count++; id(last_zone_hold) = 1; }
-                if (point_in_poly(p2_x, p2_y, id(poly_zone_2_points))) { zone2_count++; id(last_zone_hold) = 2; }
-                if (point_in_poly(p2_x, p2_y, id(poly_zone_3_points))) { zone3_count++; id(last_zone_hold) = 3; }
-                if (point_in_poly(p2_x, p2_y, id(poly_zone_4_points))) { zone4_count++; id(last_zone_hold) = 4; }
+                det_x[1] = p2_x;
+                det_y[1] = p2_y;
+                if (point_in_poly(p2_x, p2_y, id(poly_zone_1_points))) zone1_count++;
+                if (point_in_poly(p2_x, p2_y, id(poly_zone_2_points))) zone2_count++;
+                if (point_in_poly(p2_x, p2_y, id(poly_zone_3_points))) zone3_count++;
+                if (point_in_poly(p2_x, p2_y, id(poly_zone_4_points))) zone4_count++;
               }
               if (update_entities) {
                 switch (id(extra_entities)) {
@@ -1274,7 +1335,6 @@ uart:
                         id(target2_resolution).publish_state(p2_resolution);
                       }
                     }
-                    [[fallthrough]];
                   case 4:
                     p2_angle = (p2_angle * RADIANS_TO_DEGREES) - 90;
 
@@ -1284,10 +1344,8 @@ uart:
                     if (id(target2_distance).state != p2_distance) {
                       id(target2_distance).publish_state(p2_distance);
                     }
-                    [[fallthrough]];
                   case 3:
                     id(target2_active).publish_state(true);
-                    [[fallthrough]];
                   case 2:
                   case 1:
                     if (id(target2_x).state != p2_x) {
@@ -1307,7 +1365,7 @@ uart:
             bool preventClear2 = id(entry_exit_enabled).state && !any_now && prev_detected[1];
             switch (id(extra_entities)) {
               case 5:
-                if (!(assumed_present_until != 0 && millis() < assumed_present_until) && !preventClear2) {
+                if (!hold_prev && !preventClear2) {
                   if (id(target2_speed).state != 0) {
                     id(target2_speed).publish_state(0);
                   }
@@ -1315,9 +1373,8 @@ uart:
                     id(target2_resolution).publish_state(0);
                   }
                 }
-                [[fallthrough]];
               case 4:
-                if (!(assumed_present_until != 0 && millis() < assumed_present_until) && !preventClear2) {
+                if (!hold_prev && !preventClear2) {
                   if (id(target2_distance).state != 0) {
                     id(target2_distance).publish_state(0);
                   }
@@ -1325,15 +1382,13 @@ uart:
                     id(target2_angle).publish_state(0);
                   }
                 }
-                [[fallthrough]];
               case 3:
-                if (!(assumed_present_until != 0 && millis() < assumed_present_until) && !preventClear2) {
+                if (!hold_prev && !preventClear2) {
                   id(target2_active).publish_state(false);
                 }
-                [[fallthrough]];
               case 2:
               case 1:
-                if (!(assumed_present_until != 0 && millis() < assumed_present_until) && !preventClear2) {
+                if (!hold_prev && !preventClear2) {
                   if (id(target2_x).state != 0) {
                     id(target2_x).publish_state(0);
                   }
@@ -1364,7 +1419,7 @@ uart:
             if (p3_distance > max_distance) {
               p3_detected = false;
             } else {
-              float p3_angle = 0;
+              float p3_angle;
               if (installation_angle != 0 || (update_entities && id(extra_entities) >= 4)) {
                 p3_angle = atan2(p3_y, p3_x);
               }
@@ -1382,10 +1437,12 @@ uart:
                 p3_detected = false;
                 target_masked = true;
               } else {
-                if (point_in_poly(p3_x, p3_y, id(poly_zone_1_points))) { zone1_count++; id(last_zone_hold) = 1; }
-                if (point_in_poly(p3_x, p3_y, id(poly_zone_2_points))) { zone2_count++; id(last_zone_hold) = 2; }
-                if (point_in_poly(p3_x, p3_y, id(poly_zone_3_points))) { zone3_count++; id(last_zone_hold) = 3; }
-                if (point_in_poly(p3_x, p3_y, id(poly_zone_4_points))) { zone4_count++; id(last_zone_hold) = 4; }
+                det_x[2] = p3_x;
+                det_y[2] = p3_y;
+                if (point_in_poly(p3_x, p3_y, id(poly_zone_1_points))) zone1_count++;
+                if (point_in_poly(p3_x, p3_y, id(poly_zone_2_points))) zone2_count++;
+                if (point_in_poly(p3_x, p3_y, id(poly_zone_3_points))) zone3_count++;
+                if (point_in_poly(p3_x, p3_y, id(poly_zone_4_points))) zone4_count++;
               }
               if (update_entities) {
                 switch (id(extra_entities)) {
@@ -1404,7 +1461,6 @@ uart:
                         id(target3_resolution).publish_state(p3_resolution);
                       }
                     }
-                    [[fallthrough]];
                   case 4:
                     p3_angle = (p3_angle * RADIANS_TO_DEGREES) - 90;
                     
@@ -1414,10 +1470,8 @@ uart:
                     if (id(target3_distance).state != p3_distance) {
                       id(target3_distance).publish_state(p3_distance);
                     }
-                    [[fallthrough]];
                   case 3:
                     id(target3_active).publish_state(true);
-                    [[fallthrough]];
                   case 2:
                   case 1:
                     if (id(target3_x).state != p3_x) {
@@ -1437,7 +1491,7 @@ uart:
             bool preventClear3 = id(entry_exit_enabled).state && !any_now && prev_detected[2];
             switch (id(extra_entities)) {
               case 5:
-                if (!(assumed_present_until != 0 && millis() < assumed_present_until) && !preventClear3) {
+                if (!hold_prev && !preventClear3) {
                   if (id(target3_speed).state != 0) {
                     id(target3_speed).publish_state(0);
                   }
@@ -1445,9 +1499,8 @@ uart:
                     id(target3_resolution).publish_state(0);
                   }
                 }
-                [[fallthrough]];
               case 4:
-                if (!(assumed_present_until != 0 && millis() < assumed_present_until) && !preventClear3) {
+                if (!hold_prev && !preventClear3) {
                   if (id(target3_distance).state != 0) {
                     id(target3_distance).publish_state(0);
                   }
@@ -1455,15 +1508,13 @@ uart:
                     id(target3_angle).publish_state(0);
                   }
                 }
-                [[fallthrough]];
               case 3:
-                if (!(assumed_present_until != 0 && millis() < assumed_present_until) && !preventClear3) {
+                if (!hold_prev && !preventClear3) {
                   id(target3_active).publish_state(false);
                 }
-                [[fallthrough]];
               case 2:
               case 1:
-                if (!(assumed_present_until != 0 && millis() < assumed_present_until) && !preventClear3) {
+                if (!hold_prev && !preventClear3) {
                   if (id(target3_x).state != 0) {
                     id(target3_x).publish_state(0);
                   }
@@ -1472,6 +1523,238 @@ uart:
                   }
                 }
             }
+          }
+
+          // -----------------------------------------------------------------
+          // Entry/exit gated tracking (active when "Entry Exit Enabled" is on)
+          //
+          // People can only come into or leave the room through an entry zone:
+          //  * A target that first appears outside an entry zone is a false
+          //    detection (window, curtain, plant moving in the wind...). It is
+          //    followed so it stays rejected, but never counts as occupancy.
+          //  * A confirmed target that disappears outside an entry zone has not
+          //    left: the sensor lost a still person. It is held at its last
+          //    position until it is seen again or Assume Present Timeout ends.
+          //  * A confirmed target that disappears inside an entry zone has left.
+          //
+          // With no entry zone drawn, targets are accepted anywhere and every
+          // disappearance is held (there is no way out to check against).
+          // During the first 15 s after boot, or after turning Entry Exit on,
+          // targets are accepted anywhere so people already inside are counted.
+          // -----------------------------------------------------------------
+          enum TrackState : uint8_t { TRK_FREE = 0, TRK_ACTIVE, TRK_HELD, TRK_PHANTOM };
+          struct Track {
+            uint8_t state;
+            float x, y;          // last known position
+            float bx, by;        // where a false detection first appeared
+            float travel;        // furthest a false detection has moved from bx/by
+            unsigned long seen;  // last time a detection was matched to it
+          };
+          static const int MAX_TRACKS = 8;
+          // A confirmed target missing for less than this keeps its state silently,
+          // so single dropped frames neither start a hold nor count as an exit.
+          static const unsigned long COAST_MS = 1500;
+          // A false detection is remembered this long after it was last seen, so
+          // one that flickers on and off stays rejected instead of re-reporting.
+          static const unsigned long PHANTOM_LINGER_MS = 3000;
+          static Track tracks[MAX_TRACKS] = {};
+
+          const bool gate_on = id(entry_exit_enabled).state;
+          const bool e1_valid = id(poly_entry_1_points).size() >= 6;
+          const bool e2_valid = id(poly_entry_2_points).size() >= 6;
+          const bool have_entry = e1_valid || e2_valid;
+          const unsigned long now_ms = millis();
+          bool detected_now[3] = {p1_detected, p2_detected, p3_detected};
+          bool any_detected_now = p1_detected || p2_detected || p3_detected;
+
+          if (id(tracker_reset) || !gate_on) {
+            for (int t = 0; t < MAX_TRACKS; t++) tracks[t].state = TRK_FREE;
+            id(tracker_reset) = false;
+          }
+
+          auto entry_zone_of = [&](float x, float y) -> int {
+            if (e1_valid && point_in_poly(x, y, id(poly_entry_1_points))) return 1;
+            if (e2_valid && point_in_poly(x, y, id(poly_entry_2_points))) return 2;
+            return 0;
+          };
+          auto dist = [](float ax, float ay, float bx, float by) -> float {
+            float dx = ax - bx, dy = ay - by;
+            return sqrtf(dx * dx + dy * dy);
+          };
+          auto report = [&](const char *decision, int zone, float x, float y) {
+            id(entry_exit_last_decision).publish_state(decision);
+            id(entry_exit_last_zone).publish_state(zone == 1 ? "Entry 1" : (zone == 2 ? "Entry 2" : "None"));
+            id(entry_exit_last_target_x).publish_state(x);
+            id(entry_exit_last_target_y).publish_state(y);
+            ESP_LOGI("entry_exit", "%s at x=%.0f y=%.0f (entry zone %d)", decision, x, y, zone);
+          };
+
+          if (gate_on) {
+            const float match_gate = id(track_match_distance).state;
+            const float reacquire_gate = id(track_reacquire_distance).state;
+            const float promote_dist = id(false_detection_promote_distance).state;
+            const unsigned long hold_ms = (unsigned long) (id(assume_present_timeout_s).state * 1000.0f);
+            const bool in_grace = now_ms < id(entry_gate_grace_until);
+
+            int det_track[3] = {-1, -1, -1};
+            bool track_matched[MAX_TRACKS] = {};
+
+            // Match detections to existing tracks, nearest pair first.
+            //  pass 0: confirmed targets (moving or held) within match distance
+            //  pass 1: known false detections within match distance
+            //  pass 2: confirmed targets within reacquire distance (a held person
+            //          who shifted while invisible, or a large jump between frames)
+            // Confirmed targets get first pick so a person passing a flapping
+            // curtain is not mistaken for it.
+            for (int pass = 0; pass < 3; pass++) {
+              const float gate = (pass == 2) ? reacquire_gate : match_gate;
+              while (true) {
+                int best_d = -1, best_t = -1;
+                float best = gate;
+                for (int d = 0; d < 3; d++) {
+                  if (!detected_now[d] || det_track[d] >= 0) continue;
+                  for (int t = 0; t < MAX_TRACKS; t++) {
+                    if (track_matched[t]) continue;
+                    const uint8_t st = tracks[t].state;
+                    const bool eligible = (pass == 1) ? (st == TRK_PHANTOM)
+                                                      : (st == TRK_ACTIVE || st == TRK_HELD);
+                    if (!eligible) continue;
+                    const float dd = dist(det_x[d], det_y[d], tracks[t].x, tracks[t].y);
+                    if (dd <= best) { best = dd; best_d = d; best_t = t; }
+                  }
+                }
+                if (best_d < 0) break;
+                det_track[best_d] = best_t;
+                track_matched[best_t] = true;
+              }
+            }
+
+            // Move matched tracks to their new positions.
+            for (int d = 0; d < 3; d++) {
+              const int t = det_track[d];
+              if (t < 0) continue;
+              Track &tr = tracks[t];
+              tr.x = det_x[d];
+              tr.y = det_y[d];
+              tr.seen = now_ms;
+              if (tr.state == TRK_HELD) {
+                tr.state = TRK_ACTIVE;
+                report("Target Reacquired", 0, tr.x, tr.y);
+              } else if (tr.state == TRK_PHANTOM) {
+                const float moved = dist(tr.x, tr.y, tr.bx, tr.by);
+                if (moved > tr.travel) tr.travel = moved;
+                if (promote_dist > 0 && tr.travel >= promote_dist) {
+                  // It walked like a person. If someone is being held it is most
+                  // likely them, so take over that hold instead of adding a person.
+                  int held = -1;
+                  float held_d = 1e9f;
+                  for (int h = 0; h < MAX_TRACKS; h++) {
+                    if (tracks[h].state != TRK_HELD || track_matched[h]) continue;
+                    const float hd = dist(tr.x, tr.y, tracks[h].x, tracks[h].y);
+                    if (hd < held_d) { held_d = hd; held = h; }
+                  }
+                  if (held >= 0) tracks[held].state = TRK_FREE;
+                  tr.state = TRK_ACTIVE;
+                  report("False Detection Promoted", 0, tr.x, tr.y);
+                }
+              }
+            }
+
+            // Detections nobody claimed start new tracks.
+            for (int d = 0; d < 3; d++) {
+              if (!detected_now[d] || det_track[d] >= 0) continue;
+              const int ez = entry_zone_of(det_x[d], det_y[d]);
+              const bool genuine = ez != 0 || !have_entry || in_grace;
+              int slot = -1;
+              for (int t = 0; t < MAX_TRACKS && slot < 0; t++) {
+                if (tracks[t].state == TRK_FREE) slot = t;
+              }
+              if (slot < 0 && genuine) {
+                // Full: a real entry outranks a remembered false detection, then
+                // the oldest hold.
+                unsigned long oldest = 0xFFFFFFFFUL;
+                for (int pref = 0; pref < 2 && slot < 0; pref++) {
+                  const uint8_t want = pref == 0 ? TRK_PHANTOM : TRK_HELD;
+                  for (int t = 0; t < MAX_TRACKS; t++) {
+                    if (track_matched[t] || tracks[t].state != want) continue;
+                    if (tracks[t].seen < oldest) { oldest = tracks[t].seen; slot = t; }
+                  }
+                }
+              }
+              if (slot < 0) continue;
+              Track &tr = tracks[slot];
+              tr.state = genuine ? TRK_ACTIVE : TRK_PHANTOM;
+              tr.x = tr.bx = det_x[d];
+              tr.y = tr.by = det_y[d];
+              tr.travel = 0;
+              tr.seen = now_ms;
+              track_matched[slot] = true;
+              det_track[d] = slot;
+              if (genuine) {
+                if (ez != 0) report("Entered", ez, tr.x, tr.y);
+              } else {
+                report("False Detection Rejected", 0, tr.x, tr.y);
+              }
+            }
+
+            // Tracks without a detection this frame.
+            for (int t = 0; t < MAX_TRACKS; t++) {
+              Track &tr = tracks[t];
+              if (tr.state == TRK_FREE || track_matched[t]) continue;
+              const unsigned long missing = now_ms - tr.seen;
+              if (tr.state == TRK_PHANTOM) {
+                if (missing > PHANTOM_LINGER_MS) tr.state = TRK_FREE;
+              } else if (tr.state == TRK_ACTIVE) {
+                if (missing < COAST_MS) continue;
+                const int ez = entry_zone_of(tr.x, tr.y);
+                if (ez != 0) {
+                  tr.state = TRK_FREE;
+                  report("Valid Exit", ez, tr.x, tr.y);
+                } else if (hold_ms == 0) {
+                  tr.state = TRK_FREE;
+                  report("Lost (Hold Disabled)", 0, tr.x, tr.y);
+                } else {
+                  tr.state = TRK_HELD;
+                  report("Hold Started", 0, tr.x, tr.y);
+                }
+              } else if (tr.state == TRK_HELD) {
+                if (missing >= hold_ms) {
+                  tr.state = TRK_FREE;
+                  report("Hold Expired", 0, tr.x, tr.y);
+                }
+              }
+            }
+          }
+
+          // ---- Outputs ----------------------------------------------------
+          int tracked_count = 0, held_count = 0, rejected_count = 0;
+          unsigned long hold_remaining_ms = 0;
+          bool occ_now = any_detected_now;
+          if (gate_on) {
+            // Only confirmed targets (moving or held) count; false detections
+            // never turn occupancy or zones on.
+            zone1_count = zone2_count = zone3_count = zone4_count = 0;
+            const unsigned long hold_ms = (unsigned long) (id(assume_present_timeout_s).state * 1000.0f);
+            for (int t = 0; t < MAX_TRACKS; t++) {
+              const Track &tr = tracks[t];
+              if (tr.state == TRK_PHANTOM) {
+                if (tr.seen == now_ms) rejected_count++;
+                continue;
+              }
+              if (tr.state != TRK_ACTIVE && tr.state != TRK_HELD) continue;
+              tracked_count++;
+              if (tr.state == TRK_HELD) {
+                held_count++;
+                const unsigned long missing = now_ms - tr.seen;
+                const unsigned long left = missing < hold_ms ? hold_ms - missing : 0;
+                if (left > hold_remaining_ms) hold_remaining_ms = left;
+              }
+              if (point_in_poly(tr.x, tr.y, id(poly_zone_1_points))) zone1_count++;
+              if (point_in_poly(tr.x, tr.y, id(poly_zone_2_points))) zone2_count++;
+              if (point_in_poly(tr.x, tr.y, id(poly_zone_3_points))) zone3_count++;
+              if (point_in_poly(tr.x, tr.y, id(poly_zone_4_points))) zone4_count++;
+            }
+            occ_now = tracked_count > 0;
           }
 
           if (update_entities && id(extra_entities) >= 2) {
@@ -1495,159 +1778,30 @@ uart:
             }
           }
 
-          // Clear last_zone_hold if targets are detected but not in any zone
-          // This prevents stale zone data from being used when assumed presence triggers
-          bool in_any_zone = (zone1_count > 0 || zone2_count > 0 || zone3_count > 0 || zone4_count > 0);
-          if (any_now && !in_any_zone) {
-            id(last_zone_hold) = 0;
+          if (id(entry_exit_tracked_targets).state != tracked_count) {
+            id(entry_exit_tracked_targets).publish_state(tracked_count);
+          }
+          if (id(entry_exit_held_targets).state != held_count) {
+            id(entry_exit_held_targets).publish_state(held_count);
+          }
+          if (id(entry_exit_rejected_targets).state != rejected_count) {
+            id(entry_exit_rejected_targets).publish_state(rejected_count);
           }
 
-          static const int BUF_SZ = 600;
-          struct Sample { unsigned long t; float x; float y; };
-          static Sample hist[3][BUF_SZ];
-          static uint16_t head[3] = {0,0,0};
-
-          unsigned long now_ms = millis();
-          if (p1_detected) { head[0] = (head[0] + 1) % BUF_SZ; hist[0][head[0]].t = now_ms; hist[0][head[0]].x = id(target1_x).state; hist[0][head[0]].y = id(target1_y).state; }
-          if (p2_detected) { head[1] = (head[1] + 1) % BUF_SZ; hist[1][head[1]].t = now_ms; hist[1][head[1]].x = id(target2_x).state; hist[1][head[1]].y = id(target2_y).state; }
-          if (p3_detected) { head[2] = (head[2] + 1) % BUF_SZ; hist[2][head[2]].t = now_ms; hist[2][head[2]].x = id(target3_x).state; hist[2][head[2]].y = id(target3_y).state; }
-
-          bool detected_now[3] = {p1_detected, p2_detected, p3_detected};
-          bool any_detected_now = p1_detected || p2_detected || p3_detected;
-          bool had_hold = (assumed_present_until != 0 && now_ms < assumed_present_until);
-          if (any_detected_now) {
-            if (had_hold) {
-              id(entry_exit_last_decision).publish_state("Target Reacquired");
-              id(entry_exit_last_zone).publish_state("None");
-            }
-            assumed_present_until = 0;
-          }
-
-          if (id(entry_exit_enabled).state) {
-            const unsigned long window_ms = 30000;
-
-            if (!any_detected_now) {
-              for (int i = 0; i < 3; i++) {
-                if (prev_detected[i] && !detected_now[i]) {
-                  bool e1_valid = id(poly_entry_1_points).size() >= 6;
-                  bool e2_valid = id(poly_entry_2_points).size() >= 6;
-                  bool last_in_e1 = false;
-                  bool last_in_e2 = false;
-                  bool crossed_into_e1 = false;
-                  bool crossed_into_e2 = false;
-                  bool saw_outside_e1 = false;
-                  bool saw_outside_e2 = false;
-
-                  if (hist[i][head[i]].t != 0) {
-                    if (e1_valid) last_in_e1 = point_in_poly(hist[i][head[i]].x, hist[i][head[i]].y, id(poly_entry_1_points));
-                    if (e2_valid) last_in_e2 = point_in_poly(hist[i][head[i]].x, hist[i][head[i]].y, id(poly_entry_2_points));
-                  }
-
-                  if (e1_valid) {
-                    uint16_t ii = head[i];
-                    unsigned int steps = 0;
-                    while (steps < BUF_SZ) {
-                      uint16_t jj = (ii + BUF_SZ - 1) % BUF_SZ;
-                      const Sample &a = hist[i][jj];
-                      const Sample &b = hist[i][ii];
-                      if (b.t == 0 || a.t == 0) break;
-                      if (now_ms - b.t > window_ms) break;
-                      bool a_in_e1 = point_in_poly(a.x, a.y, id(poly_entry_1_points));
-                      bool b_in_e1 = point_in_poly(b.x, b.y, id(poly_entry_1_points));
-                      if (!a_in_e1 || !b_in_e1) {
-                        saw_outside_e1 = true;
-                      }
-                      if (!a_in_e1 && b_in_e1) {
-                        crossed_into_e1 = true;
-                        break;
-                      }
-                      ii = jj; steps++;
-                    }
-                  }
-                  if (e2_valid) {
-                    uint16_t ii2 = head[i];
-                    unsigned int steps2 = 0;
-                    while (steps2 < BUF_SZ) {
-                      uint16_t jj2 = (ii2 + BUF_SZ - 1) % BUF_SZ;
-                      const Sample &a2 = hist[i][jj2];
-                      const Sample &b2 = hist[i][ii2];
-                      if (b2.t == 0 || a2.t == 0) break;
-                      if (now_ms - b2.t > window_ms) break;
-                      bool a_in_e2 = point_in_poly(a2.x, a2.y, id(poly_entry_2_points));
-                      bool b_in_e2 = point_in_poly(b2.x, b2.y, id(poly_entry_2_points));
-                      if (!a_in_e2 || !b_in_e2) {
-                        saw_outside_e2 = true;
-                      }
-                      if (!a_in_e2 && b_in_e2) {
-                        crossed_into_e2 = true;
-                        break;
-                      }
-                      ii2 = jj2; steps2++;
-                    }
-                  }
-                  bool exit_e1 = e1_valid && last_in_e1 && (crossed_into_e1 || saw_outside_e1);
-                  bool exit_e2 = e2_valid && last_in_e2 && (crossed_into_e2 || saw_outside_e2);
-                  bool valid_exit = exit_e1 || exit_e2;
-                  const char *decision_zone = "None";
-                  if (exit_e1 && exit_e2) {
-                    decision_zone = "Both";
-                  } else if (exit_e1) {
-                    decision_zone = "Entry 1";
-                  } else if (exit_e2) {
-                    decision_zone = "Entry 2";
-                  } else if (e1_valid || e2_valid) {
-                    decision_zone = "Unknown";
-                  }
-                  id(entry_exit_last_target_x).publish_state(id(last_target_x_mm));
-                  id(entry_exit_last_target_y).publish_state(id(last_target_y_mm));
-                  if (!valid_exit) {
-                    unsigned long hold_ms = (unsigned long) (id(assume_present_timeout_s).state * 1000.0f);
-                    if (hold_ms > 0) {
-                      assumed_present_until = now_ms + hold_ms;
-                      id(entry_exit_last_decision).publish_state("Hold Started");
-                      id(entry_exit_last_zone).publish_state(decision_zone);
-                    }
-                  } else {
-                    id(entry_exit_last_decision).publish_state("Valid Exit");
-                    id(entry_exit_last_zone).publish_state(decision_zone);
-                  }
-                  break;
-                }
-              }
-            }
-          }
-
-          bool occ_now = any_detected_now;
-          if (!occ_now && id(entry_exit_enabled).state) {
-            if (assumed_present_until != 0 && millis() < assumed_present_until) {
-              occ_now = true;
-            }
-          }
           id(occupancy).publish_state(occ_now);
-          bool hold_active = (assumed_present_until != 0 && millis() < assumed_present_until);
+          const bool hold_active = held_count > 0;
+          hold_prev = hold_active;
           id(assumed_present_active) = hold_active;
-          id(assumed_present_until_ms) = assumed_present_until;
+          id(assumed_present_until_ms) = hold_active ? now_ms + hold_remaining_ms : 0;
           id(assumed_present).publish_state(hold_active);
-          if (hold_active) {
-            float remain = (assumed_present_until - millis()) / 1000.0f;
-            if (remain < 0) remain = 0;
-            id(assumed_present_remaining_s).publish_state(remain);
-          } else {
-            id(assumed_present_remaining_s).publish_state(0);
+          const float remain_s = (float) (hold_remaining_ms / 1000UL);
+          if (id(assumed_present_remaining_s).state != remain_s) {
+            id(assumed_present_remaining_s).publish_state(remain_s);
           }
-          if (had_hold && !hold_active && !any_detected_now) {
-            id(entry_exit_last_decision).publish_state("Hold Expired");
-            id(entry_exit_last_zone).publish_state("None");
-          }
-          bool hold_active2 = (assumed_present_until != 0 && millis() < assumed_present_until);
-          bool z1 = zone1_count > 0; if (hold_active2 && id(last_zone_hold) == 1) z1 = true;
-          bool z2 = zone2_count > 0; if (hold_active2 && id(last_zone_hold) == 2) z2 = true;
-          bool z3 = zone3_count > 0; if (hold_active2 && id(last_zone_hold) == 3) z3 = true;
-          bool z4 = zone4_count > 0; if (hold_active2 && id(last_zone_hold) == 4) z4 = true;
-          id(zone1_occupancy).publish_state(z1);
-          id(zone2_occupancy).publish_state(z2);
-          id(zone3_occupancy).publish_state(z3);
-          id(zone4_occupancy).publish_state(z4);
+          id(zone1_occupancy).publish_state(zone1_count > 0);
+          id(zone2_occupancy).publish_state(zone2_count > 0);
+          id(zone3_occupancy).publish_state(zone3_count > 0);
+          id(zone4_occupancy).publish_state(zone4_count > 0);
           prev_detected[0] = p1_detected;
           prev_detected[1] = p2_detected;
           prev_detected[2] = p3_detected;
