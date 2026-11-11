@@ -1,0 +1,13 @@
+{
+  "chipFamily": "ESP32",
+  "ota": {
+    "path": "everything-presence-lite-esp32.ota.bin",
+    "md5": "4b2a1ba009e7118003c99bc0dfaf9f71"
+  },
+  "parts": [
+    {
+      "path": "everything-presence-lite-esp32.factory.bin",
+      "offset": 0
+    }
+  ]
+}
