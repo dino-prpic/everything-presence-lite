@@ -407,7 +407,7 @@ number:
     step: 50
     optimistic: true
     restore_value: true
-    initial_value: 500
+    initial_value: 0
     unit_of_measurement: "mm"
     entity_category: config
     icon: "mdi:door"
@@ -1594,11 +1594,14 @@ uart:
           //  * A target that first shows up inside the room away from an entry
           //    zone is a false detection (window, curtain, plant in the wind).
           //    It is followed so it stays rejected, but it never counts.
-          //  * The room is the sensor's side of the entry zones. A target that
-          //    moves from an entry zone towards the sensor has come in. One
-          //    that leaves an entry zone on the far side has gone out, and so
-          //    has one the radar loses at that far edge (within Entry Exit
-          //    Door Margin of it, or walking out through it).
+          //  * The room is the sensor's side of the entry zones. A target seen
+          //    in an entry zone, or coming through one towards the sensor, is
+          //    a verified target from that moment.
+          //  * A verified target only goes away by leaving an entry zone on
+          //    the far side: seen beyond it, or lost while walking out through
+          //    it. Standing still never counts as leaving. Entry Exit Door
+          //    Margin (off by default) also releases one lost that close to
+          //    the far edge.
           //  * A person lost anywhere else is still in the room. The target is
           //    held where it was last seen until it is found again or Assume
           //    Present Timeout runs out.
@@ -1606,9 +1609,6 @@ uart:
           //    the radar to report one target stay two people, and somebody
           //    arriving next to a person who has sat still for minutes is a
           //    second person, not that person moving.
-          //  * A newcomer counts as soon as it is seen, but gets a full hold
-          //    only once it has stepped out of the entry zone into the room, so
-          //    a door leaf swinging in the entry zone leaves little behind.
           //
           // Without any entry zone, targets are accepted anywhere and every
           // lost target is held. For 15 s after boot or after turning Entry
@@ -1638,6 +1638,8 @@ uart:
             bool suspect;        // person re-found after a hold that has not walked since
             bool newcomer;       // held before it ever left the entry zone
             bool doubt;          // held, but it may well have left: short hold
+            bool leaving;        // has stepped out of an entry zone on the far side
+            uint8_t out_frames;  // frames in a row it has been clearly beyond that zone
             uint16_t uid;
             uint16_t carrier;    // uid of the person it was next to when it went missing
             float x, y;          // last measured position
@@ -1796,7 +1798,7 @@ uart:
             const int ez = entry_zone_of(x, y);
             if (ez == 0) return 0;
             const float range = sqrtf(x * x + y * y);
-            if (range < 1.0f) return 0;
+            if (range < 1.0f || door_margin <= 0) return 0;
             const float k = 1.0f + door_margin / range;
             return entry_zone_of(x * k, y * k) == ez ? 0 : ez;
           };
@@ -1806,11 +1808,15 @@ uart:
           // Was this target lost at the door line, or while walking out
           // through it? Returns the entry zone, 0 if not.
           auto door_of = [&](const Track &tr) -> int {
+            // Already past the far edge and still walking when it was lost.
+            if (tr.leaving && (tr.vx != 0 || tr.vy != 0)) return tr.zone;
             int door = at_door(tr.x, tr.y);
-            for (int k = 1; k <= 4 && door == 0; k++) {
+            const int ez = entry_zone_of(tr.x, tr.y);
+            for (int k = 1; k <= 4 && door == 0 && ez != 0; k++) {
               const float ax = tr.x + tr.vx * 0.25f * k, ay = tr.y + tr.vy * 0.25f * k;
-              if (entry_zone_of(ax, ay) == 0) break;
-              door = at_door(ax, ay);
+              if (entry_zone_of(ax, ay) != 0) door = at_door(ax, ay);
+              else if (!in_room(ax, ay)) door = ez;
+              else break;
             }
             return door;
           };
@@ -1915,9 +1921,6 @@ uart:
               for (int c = 0; c < MAX_TRACKS; c++) {
                 if (c != t && tracks[c].uid == tr.carrier && is_person(tracks[c].state) && !tracks[c].missing) {
                   carrier_idx[t] = c;
-                  // The two went to the door as one target. Which of them
-                  // walks back in, if either, cannot be seen.
-                  if (entry_zone_of(tracks[c].x, tracks[c].y) != 0) tr.doubt = true;
                 }
               }
             }
@@ -2078,11 +2081,27 @@ uart:
 
               if (tr.state == TRK_CONFIRMED) {
                 if (tr.suspect && tr.travel >= WALK_MM) tr.suspect = false;
-                // Out through the far side of an entry zone: left. Slipping
-                // behind one from the side is not an exit: still here.
-                if (!inside && out_ez != 0) {
-                  tr.state = TRK_OUTSIDE;
-                  report("Valid Exit", out_ez, nx, ny);
+                // Out through the far side of an entry zone: left, once it has
+                // been clearly beyond the zone (300 mm) for three frames in a
+                // row. Position jitter of someone standing at the edge does
+                // not do that. Slipping behind a zone from the side is not an
+                // exit either: still here.
+                if (inside) {
+                  tr.leaving = false;
+                  tr.out_frames = 0;
+                } else {
+                  if (out_ez != 0 && !tr.leaving) {
+                    tr.leaving = true;
+                    tr.zone = out_ez;
+                  }
+                  const float range = sqrtf(nx * nx + ny * ny);
+                  const float k = range > 300.0f ? 1.0f - 300.0f / range : 0;
+                  const bool clear = tr.leaving && entry_zone_of(nx * k, ny * k) == 0 && !in_room(nx * k, ny * k);
+                  tr.out_frames = clear ? tr.out_frames + 1 : 0;
+                  if (tr.out_frames >= 3) {
+                    tr.state = TRK_OUTSIDE;
+                    report("Valid Exit", tr.zone, nx, ny);
+                  }
                 }
               } else if (tr.state == TRK_TENTATIVE) {
                 if (!inside && out_ez != 0) {
@@ -2099,16 +2118,17 @@ uart:
                 }
               } else if (tr.state == TRK_OUTSIDE) {
                 if (inside) {
-                  tr.suspect = tr.newcomer = tr.doubt = tr.near_entry = tr.split = false;
+                  tr.suspect = tr.newcomer = tr.doubt = tr.near_entry = tr.split = tr.leaving = false;
+                  tr.out_frames = 0;
                   if (ez != 0 || was_ez != 0 || in_grace) {
-                    tr.state = (ez != 0) ? TRK_TENTATIVE : TRK_CONFIRMED;
+                    tr.state = (ez != 0 || was_ez != 0) ? TRK_CONFIRMED : TRK_TENTATIVE;
                     tr.zone = ez != 0 ? ez : was_ez;
                     tr.born = now_ms;
                     tr.born_inside = false;
                     tr.bx = nx;
                     tr.by = ny;
                     tr.travel = tr.last_far = 0;
-                    report("Entered", tr.zone, nx, ny);
+                    if (tr.state == TRK_CONFIRMED) report("Entered", tr.zone, nx, ny);
                   } else {
                     // Came round the side of an entry zone, not through it.
                     tr.state = TRK_PHANTOM;
@@ -2124,15 +2144,6 @@ uart:
               } else if (tr.state == TRK_PHANTOM) {
                 const bool promote = promote_dist > 0 && tr.travel >= promote_dist;
                 if (!inside) {
-                  // It walked out through an entry zone. If someone is
-                  // unaccounted for, that was them leaving.
-                  if (out_ez != 0 && tr.travel >= WALK_MM) {
-                    const int h = unaccounted_near(tr.bx, tr.by, 1e9f, t);
-                    if (h >= 0) {
-                      release(h);
-                      report("Valid Exit", out_ez, nx, ny);
-                    }
-                  }
                   tr.state = TRK_OUTSIDE;
                 } else if (tr.near_entry && tr.travel >= WALK_MM && ez == 0 &&
                            entry_gap(nx, ny, tr.zone) >= entry_gap(tr.bx, tr.by, tr.zone) + 0.5f * WALK_MM) {
@@ -2186,7 +2197,9 @@ uart:
                 st = TRK_OUTSIDE;
               } else if (!have_entry) {
                 st = TRK_CONFIRMED;
-              } else if (zone != 0 || in_grace) {
+              } else if (zone != 0) {
+                st = TRK_CONFIRMED;
+              } else if (in_grace) {
                 st = TRK_TENTATIVE;
               } else {
                 st = TRK_PHANTOM;
@@ -2222,7 +2235,8 @@ uart:
               Track &tr = tracks[slot];
               tr.state = st;
               tr.zone = zone;
-              tr.missing = tr.settled = tr.suspect = tr.newcomer = tr.doubt = false;
+              tr.missing = tr.settled = tr.suspect = tr.newcomer = tr.doubt = tr.leaving = false;
+              tr.out_frames = 0;
               tr.born_inside = st != TRK_OUTSIDE;
               tr.near_entry = near_entry;
               tr.split = split;
@@ -2240,7 +2254,7 @@ uart:
               tr.walk_ms = now_ms - STALL_MS - 1;
               track_matched[slot] = true;
               det_track[d] = slot;
-              if (st == TRK_TENTATIVE) {
+              if (st == TRK_CONFIRMED && zone != 0) {
                 report("Entered", zone, nx, ny);
               } else if (st == TRK_PHANTOM && !near_entry && !split) {
                 tr.reported = true;
@@ -2274,16 +2288,7 @@ uart:
                 if (!tr.settled && gone >= COAST_MS) {
                   tr.settled = true;
                   const int door = door_of(tr);
-                  if (door != 0 && tr.travel >= WALK_MM) {
-                    // It walked to the door and was gone. If someone is
-                    // unaccounted for, that was them leaving.
-                    const int h = unaccounted_near(tr.bx, tr.by, 1e9f, t);
-                    if (h >= 0) {
-                      release(h);
-                      report("Valid Exit", door, tr.x, tr.y);
-                    }
-                    tr.state = TRK_FREE;
-                  }
+                  if (door != 0 && tr.travel >= WALK_MM) tr.state = TRK_FREE;
                 }
                 if (gone > PHANTOM_LINGER_MS) tr.state = TRK_FREE;
               } else if (tr.state == TRK_HELD) {
