@@ -9,6 +9,9 @@ esphome:
       - text_sensor.template.publish:
           id: entry_exit_last_zone
           state: "None"
+      - text_sensor.template.publish:
+          id: entry_exit_status
+          state: "Starting"
       - binary_sensor.template.publish:
           id: zone1_occupancy
           state: false 
@@ -58,10 +61,10 @@ globals:
     type: bool
     restore_value: False
     initial_value: 'false'
-  # Entry/exit tracking: until this time every new target is accepted wherever it
-  # appears, so people already in the room at boot (or when Entry Exit is turned
-  # on) are picked up. After it, new targets must appear inside an entry zone.
-  - id: entry_gate_grace_until
+  # Entry/exit tracking: while this is above zero every new target is accepted
+  # wherever it appears in the room, so people already inside at boot (or when
+  # Entry Exit is turned on) are counted. It counts down to zero.
+  - id: entry_gate_grace_ms
     type: unsigned long
     restore_value: False
     initial_value: '15000'
@@ -145,6 +148,11 @@ text_sensor:
     id: entry_exit_last_zone
     entity_category: diagnostic
     disabled_by_default: true
+  - platform: template
+    name: "Entry Exit Status"
+    id: entry_exit_status
+    entity_category: diagnostic
+    icon: "mdi:door-open"
 
 button:
   - platform: template
@@ -272,7 +280,7 @@ switch:
     on_turn_on:
       - lambda: |-
           id(tracker_reset) = true;
-          id(entry_gate_grace_until) = millis() + 15000;
+          id(entry_gate_grace_ms) = 15000;
     on_turn_off:
       - lambda: |-
           id(tracker_reset) = true;
@@ -390,6 +398,32 @@ number:
     initial_value: 1800
     unit_of_measurement: "s"
     entity_category: config
+
+  - platform: template
+    name: "Entry Exit Door Margin"
+    id: entry_exit_door_margin
+    min_value: 0
+    max_value: 1500
+    step: 50
+    optimistic: true
+    restore_value: true
+    initial_value: 500
+    unit_of_measurement: "mm"
+    entity_category: config
+    icon: "mdi:door"
+
+  - platform: template
+    name: "Entry Exit Entry Reach"
+    id: entry_exit_entry_reach
+    min_value: 0
+    max_value: 3000
+    step: 50
+    optimistic: true
+    restore_value: true
+    initial_value: 1000
+    unit_of_measurement: "mm"
+    entity_category: config
+    icon: "mdi:door-open"
 
   - platform: template
     name: "Entry Exit Match Distance"
@@ -1086,10 +1120,17 @@ uart:
     sequence:
       # - lambda: UARTDebug::log_hex(direction, bytes, ' ');
       - lambda: |-
-          if ((millis() - id(mmwave_update_time)) <= id(mmwave_update_interval)) { 
+          // Target positions are published at the chosen Update speed. With
+          // Entry Exit on, every radar frame (10 a second) still goes through
+          // the tracker: at the door line a few hundred milliseconds decide
+          // whether someone is seen coming in or going out.
+          const bool publish_tick = (millis() - id(mmwave_update_time)) > id(mmwave_update_interval);
+          if (!publish_tick && !id(entry_exit_enabled).state) {
             return;
-          };
-          id(mmwave_update_time) = millis();
+          }
+          if (publish_tick) {
+            id(mmwave_update_time) = millis();
+          }
 
           if (bytes.size() != 30) {
             ESP_LOGW("LD2450", "Expected 30 bytes but received %hu!", bytes.size());
@@ -1097,13 +1138,16 @@ uart:
           }
 
           bool update_entities = false;
-          if(id(extra_entities) != 0) {
+          if (publish_tick && id(extra_entities) != 0) {
             id(entities_update_count) += 1;
             update_entities = id(entities_update_count) >= id(entities_update_max_count);
             if (update_entities) {
               id(entities_update_count) = 0;
             }
           }
+
+          // With Entry Exit on, Target 1-3 are filled from the tracker at the end.
+          const bool raw_entities = update_entities && !id(entry_exit_enabled).state;
 
           const static float RADIANS_TO_DEGREES = 180.0 / 3.14159265358979323846;
           const static float DEGREES_TO_RADIANS = 3.14159265358979323846 / 180.0;
@@ -1112,8 +1156,8 @@ uart:
           float max_distance = float(id(distance).state) * 10;
           float installation_angle = id(installation_angle_ui).state * DEGREES_TO_RADIANS;
 
-          // True while the entry/exit tracker is holding a target that vanished
-          // outside an entry zone (value from the previous frame).
+          // True while the entry/exit tracker is holding a target the radar
+          // cannot see (value from the previous frame).
           static bool hold_prev = false;
           float det_x[3] = {0, 0, 0};
           float det_y[3] = {0, 0, 0};
@@ -1166,7 +1210,7 @@ uart:
             if (p1_distance > max_distance) {
               p1_detected = false;
             } else {
-              float p1_angle;
+              float p1_angle = 0;
               if (installation_angle != 0 || (update_entities && id(extra_entities) >= 4)) {
                 p1_angle = atan2(p1_y, p1_x);
               }
@@ -1191,7 +1235,7 @@ uart:
                 if (point_in_poly(p1_x, p1_y, id(poly_zone_3_points))) zone3_count++;
                 if (point_in_poly(p1_x, p1_y, id(poly_zone_4_points))) zone4_count++;
               }
-              if (update_entities) {
+              if (raw_entities) {
                 switch (id(extra_entities)) {
                   case 5:
                     {
@@ -1208,6 +1252,7 @@ uart:
                         id(target1_resolution).publish_state(p1_resolution);
                       }
                     }
+                    [[fallthrough]];
                   case 4:
                     p1_angle = (p1_angle * RADIANS_TO_DEGREES) - 90;
 
@@ -1217,8 +1262,10 @@ uart:
                     if (id(target1_distance).state != p1_distance) {
                       id(target1_distance).publish_state(p1_distance);
                     }
+                    [[fallthrough]];
                   case 3:
                     id(target1_active).publish_state(true);
+                    [[fallthrough]];
                   case 2:
                   case 1:
                     if (id(target1_x).state != p1_x) {
@@ -1235,7 +1282,7 @@ uart:
           }
 
           bool any_now = p1_detected || p2_detected || p3_detected;
-          if (update_entities && !p1_detected && !target_masked) {
+          if (raw_entities && !p1_detected && !target_masked) {
             bool preventClear = id(entry_exit_enabled).state && !any_now && prev_detected[0];
             switch (id(extra_entities)) {
               case 5:
@@ -1247,6 +1294,7 @@ uart:
                     id(target1_resolution).publish_state(0);
                   }
                 }
+                [[fallthrough]];
               case 4:
                 if (!hold_prev && !preventClear) {
                   if (id(target1_distance).state != 0) {
@@ -1256,10 +1304,12 @@ uart:
                     id(target1_angle).publish_state(0);
                   }
                 }
+                [[fallthrough]];
               case 3:
                 if (!hold_prev && !preventClear) {
                   id(target1_active).publish_state(false);
                 }
+                [[fallthrough]];
               case 2:
               case 1:
                 if (!hold_prev && !preventClear) {
@@ -1293,7 +1343,7 @@ uart:
             if (p2_distance > max_distance) {
               p2_detected = false;
             } else {
-              float p2_angle;
+              float p2_angle = 0;
               if (installation_angle != 0 || (update_entities && id(extra_entities) >= 4)) {
                 p2_angle = atan2(p2_y, p2_x);
               }
@@ -1318,7 +1368,7 @@ uart:
                 if (point_in_poly(p2_x, p2_y, id(poly_zone_3_points))) zone3_count++;
                 if (point_in_poly(p2_x, p2_y, id(poly_zone_4_points))) zone4_count++;
               }
-              if (update_entities) {
+              if (raw_entities) {
                 switch (id(extra_entities)) {
                   case 5:
                     {
@@ -1335,6 +1385,7 @@ uart:
                         id(target2_resolution).publish_state(p2_resolution);
                       }
                     }
+                    [[fallthrough]];
                   case 4:
                     p2_angle = (p2_angle * RADIANS_TO_DEGREES) - 90;
 
@@ -1344,8 +1395,10 @@ uart:
                     if (id(target2_distance).state != p2_distance) {
                       id(target2_distance).publish_state(p2_distance);
                     }
+                    [[fallthrough]];
                   case 3:
                     id(target2_active).publish_state(true);
+                    [[fallthrough]];
                   case 2:
                   case 1:
                     if (id(target2_x).state != p2_x) {
@@ -1361,7 +1414,7 @@ uart:
             }
           }
 
-          if (update_entities && !p2_detected && !target_masked) {
+          if (raw_entities && !p2_detected && !target_masked) {
             bool preventClear2 = id(entry_exit_enabled).state && !any_now && prev_detected[1];
             switch (id(extra_entities)) {
               case 5:
@@ -1373,6 +1426,7 @@ uart:
                     id(target2_resolution).publish_state(0);
                   }
                 }
+                [[fallthrough]];
               case 4:
                 if (!hold_prev && !preventClear2) {
                   if (id(target2_distance).state != 0) {
@@ -1382,10 +1436,12 @@ uart:
                     id(target2_angle).publish_state(0);
                   }
                 }
+                [[fallthrough]];
               case 3:
                 if (!hold_prev && !preventClear2) {
                   id(target2_active).publish_state(false);
                 }
+                [[fallthrough]];
               case 2:
               case 1:
                 if (!hold_prev && !preventClear2) {
@@ -1419,7 +1475,7 @@ uart:
             if (p3_distance > max_distance) {
               p3_detected = false;
             } else {
-              float p3_angle;
+              float p3_angle = 0;
               if (installation_angle != 0 || (update_entities && id(extra_entities) >= 4)) {
                 p3_angle = atan2(p3_y, p3_x);
               }
@@ -1444,7 +1500,7 @@ uart:
                 if (point_in_poly(p3_x, p3_y, id(poly_zone_3_points))) zone3_count++;
                 if (point_in_poly(p3_x, p3_y, id(poly_zone_4_points))) zone4_count++;
               }
-              if (update_entities) {
+              if (raw_entities) {
                 switch (id(extra_entities)) {
                   case 5:
                     {
@@ -1461,6 +1517,7 @@ uart:
                         id(target3_resolution).publish_state(p3_resolution);
                       }
                     }
+                    [[fallthrough]];
                   case 4:
                     p3_angle = (p3_angle * RADIANS_TO_DEGREES) - 90;
                     
@@ -1470,8 +1527,10 @@ uart:
                     if (id(target3_distance).state != p3_distance) {
                       id(target3_distance).publish_state(p3_distance);
                     }
+                    [[fallthrough]];
                   case 3:
                     id(target3_active).publish_state(true);
+                    [[fallthrough]];
                   case 2:
                   case 1:
                     if (id(target3_x).state != p3_x) {
@@ -1487,7 +1546,7 @@ uart:
             }
           }
 
-          if (update_entities && !p3_detected && !target_masked) {
+          if (raw_entities && !p3_detected && !target_masked) {
             bool preventClear3 = id(entry_exit_enabled).state && !any_now && prev_detected[2];
             switch (id(extra_entities)) {
               case 5:
@@ -1499,6 +1558,7 @@ uart:
                     id(target3_resolution).publish_state(0);
                   }
                 }
+                [[fallthrough]];
               case 4:
                 if (!hold_prev && !preventClear3) {
                   if (id(target3_distance).state != 0) {
@@ -1508,10 +1568,12 @@ uart:
                     id(target3_angle).publish_state(0);
                   }
                 }
+                [[fallthrough]];
               case 3:
                 if (!hold_prev && !preventClear3) {
                   id(target3_active).publish_state(false);
                 }
+                [[fallthrough]];
               case 2:
               case 1:
                 if (!hold_prev && !preventClear3) {
@@ -1528,43 +1590,136 @@ uart:
           // -----------------------------------------------------------------
           // Entry/exit gated tracking (active when "Entry Exit Enabled" is on)
           //
-          // People can only come into or leave the room through an entry zone:
-          //  * A target that first appears outside an entry zone is a false
-          //    detection (window, curtain, plant moving in the wind...). It is
-          //    followed so it stays rejected, but never counts as occupancy.
-          //  * A confirmed target that disappears outside an entry zone has not
-          //    left: the sensor lost a still person. It is held at its last
-          //    position until it is seen again or Assume Present Timeout ends.
-          //  * A confirmed target that disappears inside an entry zone has left.
+          //  * People come into and leave the room only through an entry zone.
+          //  * A target that first shows up inside the room away from an entry
+          //    zone is a false detection (window, curtain, plant in the wind).
+          //    It is followed so it stays rejected, but it never counts.
+          //  * The room is the sensor's side of the entry zones. A target that
+          //    moves from an entry zone towards the sensor has come in. One
+          //    that leaves an entry zone on the far side has gone out, and so
+          //    has one the radar loses at that far edge (within Entry Exit
+          //    Door Margin of it, or walking out through it).
+          //  * A person lost anywhere else is still in the room. The target is
+          //    held where it was last seen until it is found again or Assume
+          //    Present Timeout runs out.
+          //  * Targets are never merged. Two people who come close enough for
+          //    the radar to report one target stay two people, and somebody
+          //    arriving next to a person who has sat still for minutes is a
+          //    second person, not that person moving.
+          //  * A newcomer counts as soon as it is seen, but gets a full hold
+          //    only once it has stepped out of the entry zone into the room, so
+          //    a door leaf swinging in the entry zone leaves little behind.
           //
-          // With no entry zone drawn, targets are accepted anywhere and every
-          // disappearance is held (there is no way out to check against).
-          // During the first 15 s after boot, or after turning Entry Exit on,
-          // targets are accepted anywhere so people already inside are counted.
+          // Without any entry zone, targets are accepted anywhere and every
+          // lost target is held. For 15 s after boot or after turning Entry
+          // Exit on, targets are accepted anywhere so people already inside
+          // are counted. The radar reports at most three targets per frame;
+          // the tracker follows up to eight things, and Target 1-3 show the
+          // first three verified targets.
           // -----------------------------------------------------------------
-          enum TrackState : uint8_t { TRK_FREE = 0, TRK_ACTIVE, TRK_HELD, TRK_PHANTOM };
+          enum TrackState : uint8_t {
+            TRK_FREE = 0,
+            TRK_OUTSIDE,    // beyond an entry zone as seen from the sensor, not counted
+            TRK_TENTATIVE,  // newcomer that has not left the entry zone yet
+            TRK_CONFIRMED,  // person in the room
+            TRK_HELD,       // person in the room the radar cannot see right now
+            TRK_LOST,       // hold ran out: not counted, but remembered
+            TRK_PHANTOM     // rejected: did not come in through an entry zone
+          };
           struct Track {
             uint8_t state;
-            float x, y;          // last known position
-            float bx, by;        // where a false detection first appeared
-            float travel;        // furthest a false detection has moved from bx/by
+            uint8_t zone;        // entry zone it came in through or first appeared next to
+            bool missing;        // no detection was matched to it on the last frame
+            bool settled;        // what its disappearance means has been decided
+            bool reported;       // its rejection has already been reported
+            bool born_inside;    // first seen inside the room, not followed in from outside
+            bool near_entry;     // rejected, but first seen just past an entry zone
+            bool split;          // rejected, but first seen right next to a person
+            bool suspect;        // person re-found after a hold that has not walked since
+            bool newcomer;       // held before it ever left the entry zone
+            bool doubt;          // held, but it may well have left: short hold
+            uint16_t uid;
+            uint16_t carrier;    // uid of the person it was next to when it went missing
+            float x, y;          // last measured position
+            float vx, vy;        // walking velocity in mm/s, zero unless clearly walking
+            float r1x, r1y;      // positions sampled every BASELINE_MS, newest and the
+            float r2x, r2y;      //   one before: the velocity is taken across them
+            float bx, by;        // where it first appeared, came in, or was re-found
+            float cx, cy;        // running centre of the spot a false detection sits on
+            float travel;        // how far it has got from bx/by, on two frames in a row
+            float last_far;
+            float speed, resolution;  // as last reported by the radar for it
             unsigned long seen;  // last time a detection was matched to it
+            unsigned long born;  // when it first appeared or came in
+            unsigned long r1_ms, r2_ms, walk_ms;
           };
           static const int MAX_TRACKS = 8;
-          // A confirmed target missing for less than this keeps its state silently,
-          // so single dropped frames neither start a hold nor count as an exit.
+          // A target missing for less than this keeps its state, so dropped
+          // frames neither start a hold nor count as an exit.
           static const unsigned long COAST_MS = 1500;
-          // A false detection is remembered this long after it was last seen, so
-          // one that flickers on and off stays rejected instead of re-reporting.
-          static const unsigned long PHANTOM_LINGER_MS = 3000;
+          // A false detection is remembered this long after it was last seen.
+          // While it is not being seen it only claims detections right on its
+          // spot, so the window that swung a minute ago is recognised again
+          // instead of being taken for a held person stirring nearby.
+          static const unsigned long PHANTOM_LINGER_MS = 300000;
+          static const float PHANTOM_SPOT_MM = 700.0f;
+          // A target that vanished next to another person may be walking along
+          // with that person for this long before it is settled on its own.
+          static const unsigned long SPLIT_WINDOW_MS = 15000;
+          // Shorter hold for a target that may well have left unseen: a
+          // newcomer lost inside the entry zone before it ever stepped into the
+          // room (it may have been the door leaf), or one that was merged with
+          // somebody who then went to the door.
+          static const unsigned long DOUBT_HOLD_MS = 120000;
+          // After a hold runs out the target stops counting but is remembered
+          // this long: if it gets up and walks it is a known person again, not
+          // a false detection.
+          static const unsigned long LOST_MEMORY_MS = 43200000UL;
+          // A newcomer becomes a full target once it is out of the entry zone
+          // and has either moved this far or been followed this long.
+          static const float CONFIRM_MM = 800.0f;
+          static const unsigned long CONFIRM_MS = 4000;
+          // Moved this far from where it appeared: walking, not swaying.
+          static const float WALK_MM = 700.0f;
+          // A rejected detection that walks this far while someone is
+          // unaccounted for is that person: nothing else in a room does that.
+          static const float TAKEOVER_MM = 1500.0f;
+          // One that appeared right next to a person needs less: the radar
+          // had most likely been reporting two people as one.
+          static const float SPLIT_MM = 1000.0f;
+          // Walking velocity: net movement across the last 0.7-1.4 s. Position
+          // jitter of a standing person never adds up to this much, and it is
+          // kept through a stall of up to STALL_MS (the radar tends to freeze a
+          // target for a moment when it walks out of view).
+          static const unsigned long BASELINE_MS = 700;
+          static const float WALK_STEP_MM = 500.0f;
+          static const float WALK_SPEED_MM_S = 500.0f;
+          static const float MAX_SPEED_MM_S = 3000.0f;
+          static const unsigned long STALL_MS = 1500;
           static Track tracks[MAX_TRACKS] = {};
+          static uint16_t next_uid = 1;
+          static unsigned long last_frame_ms = 0;
+          static const char *last_status = nullptr;
+          static uint8_t status_tick = 0;
+          static uint16_t show_uid[3] = {0, 0, 0};
 
           const bool gate_on = id(entry_exit_enabled).state;
           const bool e1_valid = id(poly_entry_1_points).size() >= 6;
           const bool e2_valid = id(poly_entry_2_points).size() >= 6;
           const bool have_entry = e1_valid || e2_valid;
+          const float door_margin = id(entry_exit_door_margin).state;
           const unsigned long now_ms = millis();
+          const unsigned long frame_ms = now_ms - last_frame_ms;
+          last_frame_ms = now_ms;
           bool detected_now[3] = {p1_detected, p2_detected, p3_detected};
+          float det_speed[3] = {0, 0, 0}, det_res[3] = {0, 0, 0};
+          for (int d = 0; d < 3; d++) {
+            int16_t sp = *((int16_t *) (&bytes[8 + 8 * d]));
+            if (sp < 0) sp += MIN_INT16_VAL;
+            else sp = -sp;
+            det_speed[d] = sp / 100.0f;
+            det_res[d] = *((uint16_t *) (&bytes[10 + 8 * d]));
+          }
           bool any_detected_now = p1_detected || p2_detected || p3_detected;
 
           if (id(tracker_reset) || !gate_on) {
@@ -1572,14 +1727,128 @@ uart:
             id(tracker_reset) = false;
           }
 
+          auto dist = [](float ax, float ay, float bx, float by) -> float {
+            float dx = ax - bx, dy = ay - by;
+            return sqrtf(dx * dx + dy * dy);
+          };
+          // Distance from a point to the nearest edge of a polygon.
+          auto edge_dist = [](float px, float py, const std::vector<float> &pts) -> float {
+            const size_t n = pts.size() / 2;
+            float best = 1e9f;
+            for (size_t i = 0, j = n - 1; i < n; j = i++) {
+              const float ax = pts[j * 2], ay = pts[j * 2 + 1];
+              const float dx = pts[i * 2] - ax, dy = pts[i * 2 + 1] - ay;
+              const float len2 = dx * dx + dy * dy;
+              float k = len2 > 0 ? ((px - ax) * dx + (py - ay) * dy) / len2 : 0;
+              if (k < 0) k = 0;
+              if (k > 1) k = 1;
+              const float ex = ax + k * dx - px, ey = ay + k * dy - py;
+              const float d = sqrtf(ex * ex + ey * ey);
+              if (d < best) best = d;
+            }
+            return best;
+          };
           auto entry_zone_of = [&](float x, float y) -> int {
             if (e1_valid && point_in_poly(x, y, id(poly_entry_1_points))) return 1;
             if (e2_valid && point_in_poly(x, y, id(poly_entry_2_points))) return 2;
             return 0;
           };
-          auto dist = [](float ax, float ay, float bx, float by) -> float {
-            float dx = ax - bx, dy = ay - by;
-            return sqrtf(dx * dx + dy * dy);
+          // How far a point is from an entry zone (0 inside it).
+          auto entry_gap = [&](float x, float y, int zone) -> float {
+            if (zone == 1 && e1_valid) {
+              return point_in_poly(x, y, id(poly_entry_1_points)) ? 0 : edge_dist(x, y, id(poly_entry_1_points));
+            }
+            if (zone == 2 && e2_valid) {
+              return point_in_poly(x, y, id(poly_entry_2_points)) ? 0 : edge_dist(x, y, id(poly_entry_2_points));
+            }
+            return 1e9f;
+          };
+          // Does the straight line from the sensor (the origin) to a point
+          // pass through a polygon, for more than a sliver of it? Grazing a
+          // corner or sitting on the edge does not count.
+          auto sight_crosses = [](float px, float py, const std::vector<float> &pts) -> bool {
+            const size_t n = pts.size() / 2;
+            float lo = 2.0f, hi = -1.0f;
+            for (size_t i = 0, j = n - 1; i < n; j = i++) {
+              const float ax = pts[j * 2], ay = pts[j * 2 + 1];
+              const float ex = pts[i * 2] - ax, ey = pts[i * 2 + 1] - ay;
+              const float den = px * ey - py * ex;
+              if (den > -1e-3f && den < 1e-3f) continue;
+              const float k = (ax * ey - ay * ex) / den;   // along the line of sight
+              const float u = (ax * py - ay * px) / den;   // along the edge
+              if (k < 0 || k > 1 || u < 0 || u > 1) continue;
+              if (k < lo) lo = k;
+              if (k > hi) hi = k;
+            }
+            return hi > lo && (hi - lo) * sqrtf(px * px + py * py) >= 200.0f;
+          };
+          // The room is everything on the sensor's side of the entry zones.
+          // A point is outside when it lies beyond an entry zone as seen from
+          // the sensor: the line of sight to it passes through that zone.
+          auto in_room = [&](float x, float y) -> bool {
+            if (e1_valid && !point_in_poly(x, y, id(poly_entry_1_points)) && sight_crosses(x, y, id(poly_entry_1_points))) return false;
+            if (e2_valid && !point_in_poly(x, y, id(poly_entry_2_points)) && sight_crosses(x, y, id(poly_entry_2_points))) return false;
+            return true;
+          };
+          // The door line: inside an entry zone and within the margin of its
+          // far edge (the one away from the sensor). Returns the zone, 0 if not.
+          auto at_door = [&](float x, float y) -> int {
+            const int ez = entry_zone_of(x, y);
+            if (ez == 0) return 0;
+            const float range = sqrtf(x * x + y * y);
+            if (range < 1.0f) return 0;
+            const float k = 1.0f + door_margin / range;
+            return entry_zone_of(x * k, y * k) == ez ? 0 : ez;
+          };
+          auto is_person = [](uint8_t st) -> bool {
+            return st == TRK_TENTATIVE || st == TRK_CONFIRMED;
+          };
+          // Was this target lost at the door line, or while walking out
+          // through it? Returns the entry zone, 0 if not.
+          auto door_of = [&](const Track &tr) -> int {
+            int door = at_door(tr.x, tr.y);
+            for (int k = 1; k <= 4 && door == 0; k++) {
+              const float ax = tr.x + tr.vx * 0.25f * k, ay = tr.y + tr.vy * 0.25f * k;
+              if (entry_zone_of(ax, ay) == 0) break;
+              door = at_door(ax, ay);
+            }
+            return door;
+          };
+          // The person nearest to a point who is unaccounted for: held, or
+          // re-found after a hold without having walked since (which may have
+          // been a false detection next to where they sit). Failing those, one
+          // whose hold ran out. -1 if nobody.
+          auto unaccounted_near = [&](float x, float y, float within, int skip) -> int {
+            int found = -1;
+            for (int tier = 0; tier < 2 && found < 0; tier++) {
+              float best = within;
+              for (int h = 0; h < MAX_TRACKS; h++) {
+                const Track &o = tracks[h];
+                if (h == skip) continue;
+                const bool fits = tier == 0 ? (o.state == TRK_HELD || (o.state == TRK_CONFIRMED && o.suspect))
+                                            : o.state == TRK_LOST;
+                if (!fits) continue;
+                const float d = dist(x, y, o.x, o.y);
+                if (d <= best) { best = d; found = h; }
+              }
+            }
+            return found;
+          };
+          // That person turned out to be elsewhere (or gone): drop the stale
+          // track. If it is being seen right now, what it follows is a false
+          // detection.
+          auto release = [&](int h) {
+            Track &o = tracks[h];
+            if (o.state != TRK_CONFIRMED) {
+              o.state = TRK_FREE;
+            } else {
+              o.state = TRK_PHANTOM;
+              o.suspect = o.near_entry = o.split = false;
+              o.reported = true;
+              o.bx = o.cx = o.x;
+              o.by = o.cy = o.y;
+              o.travel = o.last_far = 0;
+            }
           };
           auto report = [&](const char *decision, int zone, float x, float y) {
             id(entry_exit_last_decision).publish_state(decision);
@@ -1593,34 +1862,146 @@ uart:
             const float match_gate = id(track_match_distance).state;
             const float reacquire_gate = id(track_reacquire_distance).state;
             const float promote_dist = id(false_detection_promote_distance).state;
+            const float entry_reach = id(entry_exit_entry_reach).state;
             const unsigned long hold_ms = (unsigned long) (id(assume_present_timeout_s).state * 1000.0f);
-            const bool in_grace = now_ms < id(entry_gate_grace_until);
+            if (id(entry_gate_grace_ms) > frame_ms) id(entry_gate_grace_ms) -= frame_ms;
+            else id(entry_gate_grace_ms) = 0;
+            const bool in_grace = id(entry_gate_grace_ms) > 0;
 
             int det_track[3] = {-1, -1, -1};
-            bool track_matched[MAX_TRACKS] = {};
+            bool det_in_room[3] = {false, false, false};
+            int det_ez[3] = {0, 0, 0};
+            // In the room or in an entry zone, i.e. not beyond a wall.
+            bool det_reachable[3] = {false, false, false};
+            // On the sensor's side and not at the door line.
+            bool det_inner[3] = {false, false, false};
+            for (int d = 0; d < 3; d++) {
+              if (!detected_now[d]) continue;
+              det_in_room[d] = in_room(det_x[d], det_y[d]);
+              det_ez[d] = entry_zone_of(det_x[d], det_y[d]);
+              det_reachable[d] = det_in_room[d] || det_ez[d] != 0;
+              det_inner[d] = det_in_room[d] && at_door(det_x[d], det_y[d]) == 0;
+            }
 
-            // Match detections to existing tracks, nearest pair first.
-            //  pass 0: confirmed targets (moving or held) within match distance
-            //  pass 1: known false detections within match distance
-            //  pass 2: confirmed targets within reacquire distance (a held person
-            //          who shifted while invisible, or a large jump between frames)
-            // Confirmed targets get first pick so a person passing a flapping
-            // curtain is not mistaken for it.
-            for (int pass = 0; pass < 3; pass++) {
-              const float gate = (pass == 2) ? reacquire_gate : match_gate;
+            // Where each target should be now, how far from there a detection
+            // may be to continue it, and who a missing one may be walking with.
+            bool track_matched[MAX_TRACKS] = {};
+            float pred_x[MAX_TRACKS], pred_y[MAX_TRACKS], near_gate[MAX_TRACKS];
+            int carrier_idx[MAX_TRACKS];
+            for (int t = 0; t < MAX_TRACKS; t++) {
+              const Track &tr = tracks[t];
+              pred_x[t] = tr.x;
+              pred_y[t] = tr.y;
+              near_gate[t] = match_gate;
+              carrier_idx[t] = -1;
+              if (tr.state == TRK_FREE || tr.state == TRK_HELD || tr.state == TRK_LOST) continue;
+              const unsigned long gone = now_ms - tr.seen;
+              if (tr.state == TRK_PHANTOM && gone >= COAST_MS) {
+                pred_x[t] = tr.cx;
+                pred_y[t] = tr.cy;
+                near_gate[t] = PHANTOM_SPOT_MM;
+              } else if (tr.missing) {
+                // Only a target that dropped frames is projected ahead, and
+                // not far: people turn.
+                const float ahead = (gone < 500 ? gone : 500) / 1000.0f;
+                pred_x[t] += tr.vx * ahead;
+                pred_y[t] += tr.vy * ahead;
+              }
+            }
+            for (int t = 0; t < MAX_TRACKS; t++) {
+              Track &tr = tracks[t];
+              if (tr.state == TRK_FREE || !tr.missing || tr.carrier == 0) continue;
+              if (now_ms - tr.seen >= SPLIT_WINDOW_MS) continue;
+              for (int c = 0; c < MAX_TRACKS; c++) {
+                if (c != t && tracks[c].uid == tr.carrier && is_person(tracks[c].state) && !tracks[c].missing) {
+                  carrier_idx[t] = c;
+                  // The two went to the door as one target. Which of them
+                  // walks back in, if either, cannot be seen.
+                  if (entry_zone_of(tracks[c].x, tracks[c].y) != 0) tr.doubt = true;
+                }
+              }
+            }
+
+            // Match detections to targets.
+            //  pass 0: every target that is not held, close to where it should
+            //          be now. The assignment that continues the most targets
+            //          wins, then the one with the least total movement. With
+            //          two targets close together the nearest detection is not
+            //          always the right one; pairing them up as a whole keeps a
+            //          person walking past a flapping curtain, or two people
+            //          passing each other, on their own tracks.
+            //  pass 1: people who vanished right next to another person (the
+            //          radar reports two close people as one), when a second
+            //          detection shows up again beside that person.
+            //  pass 2: people held for longer, within reacquire distance of
+            //          where they were last seen. A detection at the door line,
+            //          or inside an entry zone the held person was not in, is
+            //          a new arrival instead: merging an arrival into someone
+            //          who has sat still for minutes would lose a person.
+            {
+              float cost[3][MAX_TRACKS];
+              for (int d = 0; d < 3; d++) {
+                for (int t = 0; t < MAX_TRACKS; t++) {
+                  cost[d][t] = -1.0f;
+                  const uint8_t st = tracks[t].state;
+                  if (!detected_now[d] || st == TRK_FREE || st == TRK_HELD || st == TRK_LOST) continue;
+                  const float dd = dist(det_x[d], det_y[d], pred_x[t], pred_y[t]);
+                  if (dd <= near_gate[t]) cost[d][t] = dd;
+                }
+              }
+              int best_n = -1;
+              float best_sum = 0;
+              int pick[3] = {-1, -1, -1};
+              for (int a = -1; a < MAX_TRACKS; a++) {
+                if (a >= 0 && cost[0][a] < 0) continue;
+                for (int b = -1; b < MAX_TRACKS; b++) {
+                  if (b >= 0 && (b == a || cost[1][b] < 0)) continue;
+                  for (int c = -1; c < MAX_TRACKS; c++) {
+                    if (c >= 0 && (c == a || c == b || cost[2][c] < 0)) continue;
+                    const int n = (a >= 0) + (b >= 0) + (c >= 0);
+                    const float sum = (a >= 0 ? cost[0][a] : 0) + (b >= 0 ? cost[1][b] : 0) + (c >= 0 ? cost[2][c] : 0);
+                    if (n > best_n || (n == best_n && sum < best_sum)) {
+                      best_n = n;
+                      best_sum = sum;
+                      pick[0] = a;
+                      pick[1] = b;
+                      pick[2] = c;
+                    }
+                  }
+                }
+              }
+              for (int d = 0; d < 3; d++) {
+                if (pick[d] < 0) continue;
+                det_track[d] = pick[d];
+                track_matched[pick[d]] = true;
+              }
+            }
+            for (int pass = 1; pass < 3; pass++) {
               while (true) {
                 int best_d = -1, best_t = -1;
-                float best = gate;
+                float best = 1e9f;
                 for (int d = 0; d < 3; d++) {
                   if (!detected_now[d] || det_track[d] >= 0) continue;
+                  if (pass == 1 && !det_reachable[d]) continue;
+                  if (pass == 2 && !det_inner[d]) continue;
                   for (int t = 0; t < MAX_TRACKS; t++) {
                     if (track_matched[t]) continue;
-                    const uint8_t st = tracks[t].state;
-                    const bool eligible = (pass == 1) ? (st == TRK_PHANTOM)
-                                                      : (st == TRK_ACTIVE || st == TRK_HELD);
-                    if (!eligible) continue;
-                    const float dd = dist(det_x[d], det_y[d], tracks[t].x, tracks[t].y);
-                    if (dd <= best) { best = dd; best_d = d; best_t = t; }
+                    const Track &tr = tracks[t];
+                    float limit = reacquire_gate;
+                    if (pass == 1) {
+                      if (carrier_idx[t] < 0 || (tr.state != TRK_HELD && !is_person(tr.state))) continue;
+                      limit = match_gate;
+                    } else {
+                      if (tr.state != TRK_HELD) continue;
+                      if (det_ez[d] != 0 && entry_zone_of(tr.x, tr.y) != det_ez[d]) continue;
+                    }
+                    float dd = dist(det_x[d], det_y[d], pred_x[t], pred_y[t]);
+                    if (pass == 1) {
+                      const Track &cr = tracks[carrier_idx[t]];
+                      const float dc = dist(det_x[d], det_y[d], cr.x, cr.y);
+                      if (dc < dd) dd = dc;
+                    }
+                    if (dd <= limit && dd < best) { best = dd; best_d = d; best_t = t; }
                   }
                 }
                 if (best_d < 0) break;
@@ -1629,98 +2010,322 @@ uart:
               }
             }
 
-            // Move matched tracks to their new positions.
+            // Move matched targets and apply what their new position means.
             for (int d = 0; d < 3; d++) {
               const int t = det_track[d];
               if (t < 0) continue;
               Track &tr = tracks[t];
-              tr.x = det_x[d];
-              tr.y = det_y[d];
-              tr.seen = now_ms;
+              const float nx = det_x[d], ny = det_y[d];
+              const int was_ez = entry_zone_of(tr.x, tr.y);
+              const bool inside = det_in_room[d];
+              const int ez = det_ez[d];
+              // The entry zone it is in, or was in a moment ago: an entry zone
+              // drawn flush with the wall is left the instant the line is crossed.
+              const int out_ez = ez != 0 ? ez : was_ez;
               if (tr.state == TRK_HELD) {
-                tr.state = TRK_ACTIVE;
-                report("Target Reacquired", 0, tr.x, tr.y);
-              } else if (tr.state == TRK_PHANTOM) {
-                const float moved = dist(tr.x, tr.y, tr.bx, tr.by);
-                if (moved > tr.travel) tr.travel = moved;
-                if (promote_dist > 0 && tr.travel >= promote_dist) {
-                  // It walked like a person. If someone is being held it is most
-                  // likely them, so take over that hold instead of adding a person.
-                  int held = -1;
-                  float held_d = 1e9f;
-                  for (int h = 0; h < MAX_TRACKS; h++) {
-                    if (tracks[h].state != TRK_HELD || track_matched[h]) continue;
-                    const float hd = dist(tr.x, tr.y, tracks[h].x, tracks[h].y);
-                    if (hd < held_d) { held_d = hd; held = h; }
+                tr.vx = tr.vy = 0;
+                tr.r1x = tr.r2x = nx;
+                tr.r1y = tr.r2y = ny;
+                tr.r1_ms = tr.r2_ms = now_ms;
+                tr.walk_ms = now_ms - STALL_MS - 1;
+              } else if (now_ms - tr.r1_ms >= BASELINE_MS) {
+                const float span = (now_ms - tr.r2_ms) / 1000.0f;
+                const float dx = nx - tr.r2x, dy = ny - tr.r2y;
+                const float step = sqrtf(dx * dx + dy * dy);
+                if (span <= 2.5f && step >= WALK_STEP_MM && step >= WALK_SPEED_MM_S * span) {
+                  float k = 1.0f / span;
+                  if (step * k > MAX_SPEED_MM_S) k = MAX_SPEED_MM_S / step;
+                  tr.vx = dx * k;
+                  tr.vy = dy * k;
+                  tr.walk_ms = now_ms;
+                }
+                tr.r2x = tr.r1x;
+                tr.r2y = tr.r1y;
+                tr.r2_ms = tr.r1_ms;
+                tr.r1x = nx;
+                tr.r1y = ny;
+                tr.r1_ms = now_ms;
+              }
+              if (now_ms - tr.walk_ms > STALL_MS) tr.vx = tr.vy = 0;
+              tr.x = nx;
+              tr.y = ny;
+              tr.speed = det_speed[d];
+              tr.resolution = det_res[d];
+              tr.cx += 0.2f * (nx - tr.cx);
+              tr.cy += 0.2f * (ny - tr.cy);
+              tr.seen = now_ms;
+              tr.missing = false;
+              tr.carrier = 0;
+              tr.doubt = false;
+
+              if (tr.state == TRK_HELD) {
+                if (tr.newcomer) {
+                  tr.state = TRK_TENTATIVE;
+                  tr.newcomer = false;
+                } else {
+                  tr.state = TRK_CONFIRMED;
+                  tr.suspect = true;
+                  tr.bx = nx;
+                  tr.by = ny;
+                  tr.travel = tr.last_far = 0;
+                }
+                report("Target Reacquired", 0, nx, ny);
+              }
+              const float far = dist(nx, ny, tr.bx, tr.by);
+              const float both = far < tr.last_far ? far : tr.last_far;
+              if (both > tr.travel) tr.travel = both;
+              tr.last_far = far;
+
+              if (tr.state == TRK_CONFIRMED) {
+                if (tr.suspect && tr.travel >= WALK_MM) tr.suspect = false;
+                // Out through the far side of an entry zone: left. Slipping
+                // behind one from the side is not an exit: still here.
+                if (!inside && out_ez != 0) {
+                  tr.state = TRK_OUTSIDE;
+                  report("Valid Exit", out_ez, nx, ny);
+                }
+              } else if (tr.state == TRK_TENTATIVE) {
+                if (!inside && out_ez != 0) {
+                  tr.state = TRK_OUTSIDE;
+                  report("Valid Exit", out_ez, nx, ny);
+                  // First seen at the door and straight out again: if someone
+                  // was held right there, this was them leaving.
+                  if (tr.born_inside) {
+                    const int h = unaccounted_near(tr.bx, tr.by, reacquire_gate, t);
+                    if (h >= 0) release(h);
                   }
-                  if (held >= 0) tracks[held].state = TRK_FREE;
-                  tr.state = TRK_ACTIVE;
-                  report("False Detection Promoted", 0, tr.x, tr.y);
+                } else if (inside && (ez == 0 || in_grace) && (tr.travel >= CONFIRM_MM || now_ms - tr.born >= CONFIRM_MS)) {
+                  tr.state = TRK_CONFIRMED;
+                }
+              } else if (tr.state == TRK_OUTSIDE) {
+                if (inside) {
+                  tr.suspect = tr.newcomer = tr.doubt = tr.near_entry = tr.split = false;
+                  if (ez != 0 || was_ez != 0 || in_grace) {
+                    tr.state = (ez != 0) ? TRK_TENTATIVE : TRK_CONFIRMED;
+                    tr.zone = ez != 0 ? ez : was_ez;
+                    tr.born = now_ms;
+                    tr.born_inside = false;
+                    tr.bx = nx;
+                    tr.by = ny;
+                    tr.travel = tr.last_far = 0;
+                    report("Entered", tr.zone, nx, ny);
+                  } else {
+                    // Came round the side of an entry zone, not through it.
+                    tr.state = TRK_PHANTOM;
+                    tr.bx = tr.cx = nx;
+                    tr.by = tr.cy = ny;
+                    tr.travel = tr.last_far = 0;
+                    if (!tr.reported) {
+                      tr.reported = true;
+                      report("False Detection Rejected", 0, nx, ny);
+                    }
+                  }
+                }
+              } else if (tr.state == TRK_PHANTOM) {
+                const bool promote = promote_dist > 0 && tr.travel >= promote_dist;
+                if (!inside) {
+                  // It walked out through an entry zone. If someone is
+                  // unaccounted for, that was them leaving.
+                  if (out_ez != 0 && tr.travel >= WALK_MM) {
+                    const int h = unaccounted_near(tr.bx, tr.by, 1e9f, t);
+                    if (h >= 0) {
+                      release(h);
+                      report("Valid Exit", out_ez, nx, ny);
+                    }
+                  }
+                  tr.state = TRK_OUTSIDE;
+                } else if (tr.near_entry && tr.travel >= WALK_MM && ez == 0 &&
+                           entry_gap(nx, ny, tr.zone) >= entry_gap(tr.bx, tr.by, tr.zone) + 0.5f * WALK_MM) {
+                  // First picked up just past the entry zone and walking away
+                  // from it: a person the radar was slow to see come in. Unless
+                  // someone went missing around here, then it is that person.
+                  const int h = unaccounted_near(tr.bx, tr.by, 2.0f * reacquire_gate, t);
+                  if (h >= 0) release(h);
+                  tr.state = TRK_CONFIRMED;
+                  tr.born = now_ms;
+                  tr.born_inside = true;
+                  tr.suspect = tr.newcomer = tr.doubt = false;
+                  if (h >= 0) report("Target Reacquired", 0, nx, ny);
+                  else report("Entered", tr.zone, nx, ny);
+                } else if (tr.split && tr.travel >= SPLIT_MM) {
+                  // Appeared right next to a person and walked away: two
+                  // people the radar had been reporting as one. If someone
+                  // went missing around here it is that person, otherwise the
+                  // two came in together and this one is new.
+                  const int h = unaccounted_near(tr.bx, tr.by, 2.0f * reacquire_gate, t);
+                  if (h >= 0) release(h);
+                  tr.state = TRK_CONFIRMED;
+                  tr.suspect = tr.newcomer = tr.doubt = false;
+                  report(h >= 0 ? "Target Reacquired" : "Target Split", 0, nx, ny);
+                } else if (tr.travel >= TAKEOVER_MM || promote) {
+                  const int h = unaccounted_near(tr.bx, tr.by, 1e9f, t);
+                  if (h >= 0) {
+                    // It walks like a person and someone is unaccounted for:
+                    // it is that person, not an extra one.
+                    release(h);
+                    tr.state = TRK_CONFIRMED;
+                    tr.suspect = tr.newcomer = tr.doubt = false;
+                    report("Target Reacquired", 0, nx, ny);
+                  } else if (promote) {
+                    tr.state = TRK_CONFIRMED;
+                    tr.suspect = tr.newcomer = tr.doubt = false;
+                    report("False Detection Promoted", 0, nx, ny);
+                  }
                 }
               }
             }
 
-            // Detections nobody claimed start new tracks.
+            // Detections nobody claimed start new targets.
             for (int d = 0; d < 3; d++) {
               if (!detected_now[d] || det_track[d] >= 0) continue;
-              const int ez = entry_zone_of(det_x[d], det_y[d]);
-              const bool genuine = ez != 0 || !have_entry || in_grace;
+              const float nx = det_x[d], ny = det_y[d];
+              uint8_t st;
+              int zone = det_ez[d];
+              bool near_entry = false, split = false;
+              if (!det_in_room[d]) {
+                st = TRK_OUTSIDE;
+              } else if (!have_entry) {
+                st = TRK_CONFIRMED;
+              } else if (zone != 0 || in_grace) {
+                st = TRK_TENTATIVE;
+              } else {
+                st = TRK_PHANTOM;
+                if (entry_reach > 0) {
+                  const float g1 = entry_gap(nx, ny, 1), g2 = entry_gap(nx, ny, 2);
+                  if (g1 <= g2 && g1 <= entry_reach) zone = 1;
+                  else if (g2 < g1 && g2 <= entry_reach) zone = 2;
+                }
+                near_entry = zone != 0;
+                for (int c = 0; c < MAX_TRACKS; c++) {
+                  if (track_matched[c] && is_person(tracks[c].state) && dist(nx, ny, tracks[c].x, tracks[c].y) <= match_gate) split = true;
+                }
+              }
               int slot = -1;
               for (int t = 0; t < MAX_TRACKS && slot < 0; t++) {
                 if (tracks[t].state == TRK_FREE) slot = t;
               }
-              if (slot < 0 && genuine) {
-                // Full: a real entry outranks a remembered false detection, then
-                // the oldest hold.
-                unsigned long oldest = 0xFFFFFFFFUL;
-                for (int pref = 0; pref < 2 && slot < 0; pref++) {
-                  const uint8_t want = pref == 0 ? TRK_PHANTOM : TRK_HELD;
+              if (slot < 0) {
+                // Full: forget the stalest thing that is not a person in the
+                // room. A new person may also displace the oldest hold.
+                const uint8_t order[4] = {TRK_PHANTOM, TRK_OUTSIDE, TRK_LOST, TRK_HELD};
+                const int tiers = is_person(st) ? 4 : 3;
+                for (int k = 0; k < tiers && slot < 0; k++) {
+                  unsigned long oldest = 0;
                   for (int t = 0; t < MAX_TRACKS; t++) {
-                    if (track_matched[t] || tracks[t].state != want) continue;
-                    if (tracks[t].seen < oldest) { oldest = tracks[t].seen; slot = t; }
+                    if (track_matched[t] || tracks[t].state != order[k]) continue;
+                    const unsigned long age = now_ms - tracks[t].seen;
+                    if (slot < 0 || age > oldest) { oldest = age; slot = t; }
                   }
                 }
               }
               if (slot < 0) continue;
               Track &tr = tracks[slot];
-              tr.state = genuine ? TRK_ACTIVE : TRK_PHANTOM;
-              tr.x = tr.bx = det_x[d];
-              tr.y = tr.by = det_y[d];
-              tr.travel = 0;
-              tr.seen = now_ms;
+              tr.state = st;
+              tr.zone = zone;
+              tr.missing = tr.settled = tr.suspect = tr.newcomer = tr.doubt = false;
+              tr.born_inside = st != TRK_OUTSIDE;
+              tr.near_entry = near_entry;
+              tr.split = split;
+              tr.reported = false;
+              tr.uid = next_uid++;
+              if (next_uid == 0) next_uid = 1;
+              tr.carrier = 0;
+              tr.x = tr.bx = tr.cx = tr.r1x = tr.r2x = nx;
+              tr.y = tr.by = tr.cy = tr.r1y = tr.r2y = ny;
+              tr.vx = tr.vy = 0;
+              tr.travel = tr.last_far = 0;
+              tr.speed = det_speed[d];
+              tr.resolution = det_res[d];
+              tr.seen = tr.born = tr.r1_ms = tr.r2_ms = now_ms;
+              tr.walk_ms = now_ms - STALL_MS - 1;
               track_matched[slot] = true;
               det_track[d] = slot;
-              if (genuine) {
-                if (ez != 0) report("Entered", ez, tr.x, tr.y);
-              } else {
-                report("False Detection Rejected", 0, tr.x, tr.y);
+              if (st == TRK_TENTATIVE) {
+                report("Entered", zone, nx, ny);
+              } else if (st == TRK_PHANTOM && !near_entry && !split) {
+                tr.reported = true;
+                report("False Detection Rejected", 0, nx, ny);
               }
             }
 
-            // Tracks without a detection this frame.
+            // Targets without a detection this frame.
             for (int t = 0; t < MAX_TRACKS; t++) {
               Track &tr = tracks[t];
               if (tr.state == TRK_FREE || track_matched[t]) continue;
-              const unsigned long missing = now_ms - tr.seen;
-              if (tr.state == TRK_PHANTOM) {
-                if (missing > PHANTOM_LINGER_MS) tr.state = TRK_FREE;
-              } else if (tr.state == TRK_ACTIVE) {
-                if (missing < COAST_MS) continue;
-                const int ez = entry_zone_of(tr.x, tr.y);
-                if (ez != 0) {
+              const unsigned long gone = now_ms - tr.seen;
+              if (!tr.missing) {
+                tr.missing = true;
+                tr.settled = false;
+                tr.carrier = 0;
+                if (is_person(tr.state)) {
+                  // Did it vanish right next to another person the radar still
+                  // sees? Then the radar has most likely merged the two.
+                  float best = match_gate;
+                  for (int c = 0; c < MAX_TRACKS; c++) {
+                    if (c == t || !track_matched[c] || !is_person(tracks[c].state)) continue;
+                    const float dd = dist(pred_x[t], pred_y[t], tracks[c].x, tracks[c].y);
+                    if (dd <= best) { best = dd; tr.carrier = tracks[c].uid; }
+                  }
+                }
+              }
+              if (tr.state == TRK_OUTSIDE) {
+                if (gone > COAST_MS) tr.state = TRK_FREE;
+              } else if (tr.state == TRK_PHANTOM) {
+                if (!tr.settled && gone >= COAST_MS) {
+                  tr.settled = true;
+                  const int door = door_of(tr);
+                  if (door != 0 && tr.travel >= WALK_MM) {
+                    // It walked to the door and was gone. If someone is
+                    // unaccounted for, that was them leaving.
+                    const int h = unaccounted_near(tr.bx, tr.by, 1e9f, t);
+                    if (h >= 0) {
+                      release(h);
+                      report("Valid Exit", door, tr.x, tr.y);
+                    }
+                    tr.state = TRK_FREE;
+                  }
+                }
+                if (gone > PHANTOM_LINGER_MS) tr.state = TRK_FREE;
+              } else if (tr.state == TRK_HELD) {
+                const unsigned long limit = (tr.doubt && hold_ms > DOUBT_HOLD_MS) ? DOUBT_HOLD_MS : hold_ms;
+                if (gone >= limit) {
+                  tr.state = TRK_LOST;
+                  report("Hold Expired", 0, tr.x, tr.y);
+                }
+              } else if (tr.state == TRK_LOST) {
+                if (gone > LOST_MEMORY_MS) tr.state = TRK_FREE;
+              } else {
+                if (gone < COAST_MS) continue;
+                // Still merged with someone the radar sees?
+                bool merged = false;
+                if (tr.carrier != 0 && gone < SPLIT_WINDOW_MS) {
+                  for (int c = 0; c < MAX_TRACKS; c++) {
+                    if (c != t && tracks[c].uid == tr.carrier && is_person(tracks[c].state) && track_matched[c]) merged = true;
+                  }
+                }
+                const int door = door_of(tr);
+                if (door != 0) {
+                  // Gone through the door. If it is merged with someone who
+                  // is still at the door, wait and see whether the two come
+                  // back in together.
+                  if (merged) continue;
+                  const bool passer = tr.state == TRK_TENTATIVE && tr.born_inside;
                   tr.state = TRK_FREE;
-                  report("Valid Exit", ez, tr.x, tr.y);
+                  report("Valid Exit", door, tr.x, tr.y);
+                  if (passer) {
+                    const int h = unaccounted_near(tr.bx, tr.by, reacquire_gate, t);
+                    if (h >= 0) release(h);
+                  }
                 } else if (hold_ms == 0) {
                   tr.state = TRK_FREE;
                   report("Lost (Hold Disabled)", 0, tr.x, tr.y);
                 } else {
+                  tr.newcomer = tr.state == TRK_TENTATIVE;
+                  if (tr.newcomer) tr.doubt = true;
                   tr.state = TRK_HELD;
+                  tr.suspect = false;
+                  tr.vx = tr.vy = 0;
                   report("Hold Started", 0, tr.x, tr.y);
-                }
-              } else if (tr.state == TRK_HELD) {
-                if (missing >= hold_ms) {
-                  tr.state = TRK_FREE;
-                  report("Hold Expired", 0, tr.x, tr.y);
                 }
               }
             }
@@ -1731,22 +2336,23 @@ uart:
           unsigned long hold_remaining_ms = 0;
           bool occ_now = any_detected_now;
           if (gate_on) {
-            // Only confirmed targets (moving or held) count; false detections
-            // never turn occupancy or zones on.
+            // Only people (seen, merged or held) count. False detections and
+            // anything beyond the room outline never turn occupancy on.
             zone1_count = zone2_count = zone3_count = zone4_count = 0;
             const unsigned long hold_ms = (unsigned long) (id(assume_present_timeout_s).state * 1000.0f);
             for (int t = 0; t < MAX_TRACKS; t++) {
               const Track &tr = tracks[t];
               if (tr.state == TRK_PHANTOM) {
-                if (tr.seen == now_ms) rejected_count++;
+                if (!tr.missing) rejected_count++;
                 continue;
               }
-              if (tr.state != TRK_ACTIVE && tr.state != TRK_HELD) continue;
+              if (!is_person(tr.state) && tr.state != TRK_HELD) continue;
               tracked_count++;
               if (tr.state == TRK_HELD) {
                 held_count++;
-                const unsigned long missing = now_ms - tr.seen;
-                const unsigned long left = missing < hold_ms ? hold_ms - missing : 0;
+                const unsigned long gone = now_ms - tr.seen;
+                const unsigned long limit = (tr.doubt && hold_ms > DOUBT_HOLD_MS) ? DOUBT_HOLD_MS : hold_ms;
+                const unsigned long left = gone < limit ? limit - gone : 0;
                 if (left > hold_remaining_ms) hold_remaining_ms = left;
               }
               if (point_in_poly(tr.x, tr.y, id(poly_zone_1_points))) zone1_count++;
@@ -1755,6 +2361,92 @@ uart:
               if (point_in_poly(tr.x, tr.y, id(poly_zone_4_points))) zone4_count++;
             }
             occ_now = tracked_count > 0;
+          }
+
+          // Setup check, so a zone layout that cannot work is visible.
+          if ((status_tick++ & 31) == 0 || last_status == nullptr) {
+            const char *status = "OK";
+            if (!gate_on) {
+              status = "Entry Exit off";
+            } else if (!have_entry) {
+              status = "No entry zone: every target accepted and held";
+            } else if ((e1_valid && point_in_poly(0, 0, id(poly_entry_1_points))) || (e2_valid && point_in_poly(0, 0, id(poly_entry_2_points)))) {
+              status = "Entry zone covers the sensor: draw it over the door only";
+            }
+            if (status != last_status) {
+              last_status = status;
+              id(entry_exit_status).publish_state(status);
+            }
+          }
+
+          // With Entry Exit on, Target 1-3 show verified targets (people seen,
+          // merged or held), not raw radar slots. The tracker follows up to
+          // MAX_TRACKS things; a target keeps its number while it exists.
+          if (gate_on && update_entities) {
+            for (int k = 0; k < 3; k++) {
+              bool alive = false;
+              for (int t = 0; t < MAX_TRACKS; t++) {
+                if (tracks[t].uid == show_uid[k] && (is_person(tracks[t].state) || tracks[t].state == TRK_HELD)) alive = true;
+              }
+              if (!alive) show_uid[k] = 0;
+            }
+            for (int t = 0; t < MAX_TRACKS; t++) {
+              const Track &tr = tracks[t];
+              if (!is_person(tr.state) && tr.state != TRK_HELD) continue;
+              if (tr.uid == show_uid[0] || tr.uid == show_uid[1] || tr.uid == show_uid[2]) continue;
+              for (int k = 0; k < 3; k++) {
+                if (show_uid[k] == 0) { show_uid[k] = tr.uid; break; }
+              }
+            }
+            const unsigned int level = id(extra_entities);
+            float shown[3][6] = {};
+            bool shown_on[3] = {false, false, false};
+            for (int k = 0; k < 3; k++) {
+              for (int t = 0; t < MAX_TRACKS && show_uid[k] != 0; t++) {
+                const Track &tr = tracks[t];
+                if (tr.uid != show_uid[k] || (!is_person(tr.state) && tr.state != TRK_HELD)) continue;
+                shown_on[k] = true;
+                shown[k][0] = roundf(tr.x);
+                shown[k][1] = roundf(tr.y);
+                shown[k][2] = tr.state == TRK_HELD ? 0 : tr.speed;
+                shown[k][3] = tr.resolution;
+                shown[k][4] = atan2f(tr.y, tr.x) * RADIANS_TO_DEGREES - 90;
+                shown[k][5] = sqrtf(tr.x * tr.x + tr.y * tr.y);
+              }
+            }
+            if (id(target1_x).state != shown[0][0]) id(target1_x).publish_state(shown[0][0]);
+            if (id(target1_y).state != shown[0][1]) id(target1_y).publish_state(shown[0][1]);
+            if (level >= 3) id(target1_active).publish_state(shown_on[0]);
+            if (level >= 4) {
+              if (id(target1_angle).state != shown[0][4]) id(target1_angle).publish_state(shown[0][4]);
+              if (id(target1_distance).state != shown[0][5]) id(target1_distance).publish_state(shown[0][5]);
+            }
+            if (level >= 5) {
+              if (id(target1_speed).state != shown[0][2]) id(target1_speed).publish_state(shown[0][2]);
+              if (id(target1_resolution).state != shown[0][3]) id(target1_resolution).publish_state(shown[0][3]);
+            }
+            if (id(target2_x).state != shown[1][0]) id(target2_x).publish_state(shown[1][0]);
+            if (id(target2_y).state != shown[1][1]) id(target2_y).publish_state(shown[1][1]);
+            if (level >= 3) id(target2_active).publish_state(shown_on[1]);
+            if (level >= 4) {
+              if (id(target2_angle).state != shown[1][4]) id(target2_angle).publish_state(shown[1][4]);
+              if (id(target2_distance).state != shown[1][5]) id(target2_distance).publish_state(shown[1][5]);
+            }
+            if (level >= 5) {
+              if (id(target2_speed).state != shown[1][2]) id(target2_speed).publish_state(shown[1][2]);
+              if (id(target2_resolution).state != shown[1][3]) id(target2_resolution).publish_state(shown[1][3]);
+            }
+            if (id(target3_x).state != shown[2][0]) id(target3_x).publish_state(shown[2][0]);
+            if (id(target3_y).state != shown[2][1]) id(target3_y).publish_state(shown[2][1]);
+            if (level >= 3) id(target3_active).publish_state(shown_on[2]);
+            if (level >= 4) {
+              if (id(target3_angle).state != shown[2][4]) id(target3_angle).publish_state(shown[2][4]);
+              if (id(target3_distance).state != shown[2][5]) id(target3_distance).publish_state(shown[2][5]);
+            }
+            if (level >= 5) {
+              if (id(target3_speed).state != shown[2][2]) id(target3_speed).publish_state(shown[2][2]);
+              if (id(target3_resolution).state != shown[2][3]) id(target3_resolution).publish_state(shown[2][3]);
+            }
           }
 
           if (update_entities && id(extra_entities) >= 2) {
@@ -1794,7 +2486,7 @@ uart:
           id(assumed_present_active) = hold_active;
           id(assumed_present_until_ms) = hold_active ? now_ms + hold_remaining_ms : 0;
           id(assumed_present).publish_state(hold_active);
-          const float remain_s = (float) (hold_remaining_ms / 1000UL);
+          const float remain_s = (float) ((hold_remaining_ms + 4999UL) / 5000UL * 5UL);
           if (id(assumed_present_remaining_s).state != remain_s) {
             id(assumed_present_remaining_s).publish_state(remain_s);
           }
